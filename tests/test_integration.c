@@ -53,6 +53,10 @@
 #define MARIA_JID "5511888887777@s.whatsapp.net"
 #define MARIA_TEXT "oi do servidor \xc3\xa9 \xf0\x9f\x98\x80"
 #define REPLY_TEXT "resposta do cliente"
+#define GROUP_JID "120363001@g.us"
+#define GROUP_TEXT "mensagem no grupo"
+#define GROUP_IN_TEXT "oi grupo, aqui \xc3\xa9 a Maria"
+#define MARIA_ADDR "5511888887777:0"
 
 static char g_dir[256];
 static EVP_PKEY *g_tls_key;
@@ -810,6 +814,157 @@ static int run_server(int lfd)
     if (strcmp(wa_node_attr(rack, "class"), "receipt") != 0)
         die("receipt not acknowledged");
 
+    /* ---------------- group: client -> group ---------------- */
+    wa_node *gq = expect_node(c, "iq", "w:g2");
+    if (strcmp(wa_node_attr(gq, "to"), GROUP_JID) != 0 ||
+        wa_node_child(gq, "query") == NULL)
+        die("bad group info query");
+    {
+        wa_attr p1[] = {WA_ATTR_JID("jid", MARIA_JID)};
+        wa_attr p2[] = {WA_ATTR_JID("jid", PHONE_USER "@s.whatsapp.net"),
+                        WA_ATTR("type", "admin")};
+        wa_node parts2[2] = {{"participant", p1, 1, NULL, 0, NULL, 0, WA_CONTENT_NONE},
+                             {"participant", p2, 2, NULL, 0, NULL, 0, WA_CONTENT_NONE}};
+        wa_attr ga[] = {WA_ATTR("id", "120363001"), WA_ATTR("subject", "Familia"),
+                        WA_ATTR("addressing_mode", "pn")};
+        wa_node group = {"group", ga, 3, parts2, 2, NULL, 0, WA_CONTENT_CHILDREN};
+        char gid[64];
+        zstrlcpy(gid, wa_node_attr(gq, "id"), sizeof gid);
+        wa_attr ra2[] = {WA_ATTR_JID("from", GROUP_JID), WA_ATTR("id", gid),
+                         WA_ATTR("type", "result")};
+        wa_node res = {"iq", ra2, 3, &group, 1, NULL, 0, WA_CONTENT_CHILDREN};
+        send_node(c, &res);
+    }
+    us = expect_node(c, "iq", "usync");
+    {
+        const wa_node *ul = wa_node_path(us, "usync", "list", NULL);
+        if (ul == NULL || ul->child_count != 2)
+            die("group usync should list 2 users");
+        static wa_attr da0[] = {WA_ATTR("id", "0")};
+        static wa_attr da5[] = {WA_ATTR("id", "5")};
+        wa_node maria_devs[1] = {{"device", da0, 1, NULL, 0, NULL, 0, WA_CONTENT_NONE}};
+        wa_node own_devs[2] = {{"device", da0, 1, NULL, 0, NULL, 0, WA_CONTENT_NONE},
+                               {"device", da5, 1, NULL, 0, NULL, 0, WA_CONTENT_NONE}};
+        wa_node mdl = {"device-list", NULL, 0, maria_devs, 1, NULL, 0, WA_CONTENT_CHILDREN};
+        wa_node odl = {"device-list", NULL, 0, own_devs, 2, NULL, 0, WA_CONTENT_CHILDREN};
+        wa_node mdv = {"devices", NULL, 0, &mdl, 1, NULL, 0, WA_CONTENT_CHILDREN};
+        wa_node odv = {"devices", NULL, 0, &odl, 1, NULL, 0, WA_CONTENT_CHILDREN};
+        wa_attr mu[] = {WA_ATTR_JID("jid", MARIA_JID)};
+        wa_attr ou[] = {WA_ATTR_JID("jid", PHONE_USER "@s.whatsapp.net")};
+        wa_node users[2] = {{"user", mu, 1, &mdv, 1, NULL, 0, WA_CONTENT_CHILDREN},
+                            {"user", ou, 1, &odv, 1, NULL, 0, WA_CONTENT_CHILDREN}};
+        wa_node list = {"list", NULL, 0, users, 2, NULL, 0, WA_CONTENT_CHILDREN};
+        wa_node usync = {"usync", NULL, 0, &list, 1, NULL, 0, WA_CONTENT_CHILDREN};
+        send_iq_result(c, us, &usync, 1);
+    }
+    wa_node *gm = expect_node(c, "message", NULL);
+    char gm_id[64];
+    zstrlcpy(gm_id, wa_node_attr(gm, "id"), sizeof gm_id);
+    const char *ph = wa_node_attr(gm, "phash");
+    if (strcmp(wa_node_attr(gm, "to"), GROUP_JID) != 0 || ph == NULL ||
+        strncmp(ph, "2:", 2) != 0 || strlen(ph) != 10)
+        die("bad group message attributes");
+    const wa_node *gparts = wa_node_child(gm, "participants");
+    const wa_node *skenc = NULL;
+    for (size_t i = 0; i < gm->child_count; i++)
+        if (strcmp(gm->children[i].tag, "enc") == 0)
+            skenc = &gm->children[i];
+    if (gparts == NULL || gparts->child_count != 2 || skenc == NULL ||
+        strcmp(wa_node_attr(skenc, "type"), "skmsg") != 0)
+        die("group message structure");
+    static uint8_t skbuf[4096];
+    size_t sklen = skenc->data_len;
+    memcpy(skbuf, skenc->data, sklen);
+    int skdm_seen = 0;
+    for (size_t i = 0; i < gparts->child_count; i++) {
+        const wa_node *to = &gparts->children[i];
+        const char *jid = wa_node_attr(to, "jid");
+        const wa_node *e = wa_node_child(to, "enc");
+        static uint8_t plain[4096];
+        long n;
+        int is_maria = strcmp(jid, MARIA_JID) == 0;
+        storage_init(is_maria ? addr_dir_maria : addr_dir_phone);
+        n = signal_decrypt(is_maria ? &maria : &phone, CLIENT_ADDR,
+                           strcmp(wa_node_attr(e, "type"), "pkmsg") == 0,
+                           e->data, e->data_len, plain, sizeof plain);
+        if (n < 0)
+            die("cannot decrypt SKDM envelope for %s", jid);
+        n = wa_unpad_message(plain, (size_t)n);
+        const uint8_t *skd, *gidp, *ax;
+        size_t skdl, gidl, axl;
+        if (pb_find_bytes(plain, (size_t)n, 2, &skd, &skdl) != 1 ||
+            pb_find_bytes(skd, skdl, 1, &gidp, &gidl) != 1 ||
+            pb_find_bytes(skd, skdl, 2, &ax, &axl) != 1 ||
+            gidl != strlen(GROUP_JID) || memcmp(gidp, GROUP_JID, gidl) != 0)
+            die("bad SKDM message");
+        if (is_maria) {
+            if (senderkey_process(GROUP_JID, CLIENT_ADDR, ax, axl) != 0)
+                die("Maria cannot process SKDM");
+            long gn = senderkey_decrypt(GROUP_JID, CLIENT_ADDR, skbuf, sklen,
+                                        plain, sizeof plain);
+            if (gn < 0)
+                die("Maria cannot decrypt skmsg");
+            gn = wa_unpad_message(plain, (size_t)gn);
+            const uint8_t *txt;
+            size_t tl;
+            if (pb_find_bytes(plain, (size_t)gn, 1, &txt, &tl) != 1 ||
+                tl != strlen(GROUP_TEXT) || memcmp(txt, GROUP_TEXT, tl) != 0)
+                die("group text mismatch");
+            skdm_seen = 1;
+        }
+    }
+    if (!skdm_seen)
+        die("Maria never got the group message");
+    fprintf(stderr, "  [server] group message decrypted via sender key\n");
+    {
+        wa_attr ga2[] = {WA_ATTR("class", "message"), WA_ATTR("id", gm_id),
+                         WA_ATTR_JID("from", GROUP_JID), WA_ATTR("t", tbuf)};
+        wa_node gack = {"ack", ga2, 4, NULL, 0, NULL, 0, WA_CONTENT_NONE};
+        send_node(c, &gack);
+        wa_attr gr[] = {WA_ATTR_JID("from", GROUP_JID), WA_ATTR("id", gm_id),
+                        WA_ATTR_JID("participant", MARIA_JID), WA_ATTR("t", tbuf)};
+        wa_node grc = {"receipt", gr, 4, NULL, 0, NULL, 0, WA_CONTENT_NONE};
+        send_node(c, &grc);
+        expect_node(c, "ack", NULL);
+    }
+
+    /* ---------------- group: Maria -> group ---------------- */
+    {
+        static uint8_t dist[256], skd_msg[512], pad2[1024], env[2048], gsk[2048];
+        storage_init(addr_dir_maria);
+        long dl = senderkey_distribution(GROUP_JID, MARIA_ADDR, dist, sizeof dist);
+        zbuf zb;
+        zbuf_init(&zb, skd_msg, sizeof skd_msg);
+        size_t mk = pb_begin(&zb, 2);
+        pb_put_string(&zb, 1, GROUP_JID);
+        pb_put_bytes(&zb, 2, dist, (size_t)dl);
+        pb_end(&zb, mk);
+        memcpy(pad2, skd_msg, zb.len);
+        size_t p2 = wa_pad_message(pad2, zb.len, sizeof pad2);
+        int pk2 = 0;
+        long envl = signal_encrypt(&maria, CLIENT_ADDR, pad2, p2, env, sizeof env, &pk2);
+        size_t gl = padded_message(GROUP_IN_TEXT, pad2, sizeof pad2);
+        long gskl = senderkey_encrypt(GROUP_JID, MARIA_ADDR, pad2, gl, gsk, sizeof gsk);
+        if (dl < 0 || envl < 0 || gskl < 0)
+            die("cannot build incoming group message");
+        wa_attr e1[] = {WA_ATTR("v", "2"), WA_ATTR("type", pk2 ? "pkmsg" : "msg")};
+        wa_attr e2[] = {WA_ATTR("v", "2"), WA_ATTR("type", "skmsg")};
+        wa_node encs2[2] = {{"enc", e1, 2, NULL, 0, env, (size_t)envl, WA_CONTENT_BYTES},
+                            {"enc", e2, 2, NULL, 0, gsk, (size_t)gskl, WA_CONTENT_BYTES}};
+        wa_attr ma2[] = {WA_ATTR_JID("from", GROUP_JID), WA_ATTR("id", "GMSG1"),
+                         WA_ATTR_JID("participant", MARIA_JID), WA_ATTR("t", tbuf),
+                         WA_ATTR("type", "text"), WA_ATTR("notify", "Maria")};
+        wa_node gmsg = {"message", ma2, 6, encs2, 2, NULL, 0, WA_CONTENT_CHILDREN};
+        send_node(c, &gmsg);
+        wa_node *grr = expect_node(c, "receipt", NULL);
+        if (strcmp(wa_node_attr(grr, "id"), "GMSG1") != 0 ||
+            wa_node_attr(grr, "participant") == NULL ||
+            strcmp(wa_node_attr(grr, "participant"), MARIA_JID) != 0)
+            die("bad receipt for group message");
+        expect_node(c, "ack", NULL);
+        fprintf(stderr, "  [server] client decrypted incoming group message\n");
+    }
+
     /* stay until the client hangs up */
     uint8_t tmp[16];
     while (SSL_read(c->ssl, tmp, sizeof tmp) > 0) {
@@ -833,6 +988,12 @@ typedef struct {
     char sent_id[64];
     int sent_acked;
     int delivered;
+    char group_id[64];
+    int group_delivered;
+    int group_msg;
+    char group_text[256];
+    char group_sender[64];
+    char chat_name[64];
 } client_obs;
 
 static client_obs g_obs;
@@ -869,6 +1030,12 @@ static void ev_paired(void *u, const wa_jid *j, const char *p)
 static void ev_message(void *u, const wa_message *m)
 {
     (void)u;
+    if (jid_is_group(&m->chat)) {
+        g_obs.group_msg++;
+        zstrlcpy(g_obs.group_text, m->text, sizeof g_obs.group_text);
+        jid_format(&m->sender, g_obs.group_sender, sizeof g_obs.group_sender);
+        return;
+    }
     g_obs.got_message++;
     zstrlcpy(g_obs.msg_text, m->text, sizeof g_obs.msg_text);
     jid_format(&m->chat, g_obs.msg_from, sizeof g_obs.msg_from);
@@ -880,12 +1047,21 @@ static void ev_receipt(void *u, const wa_jid *chat, const char *id,
 {
     (void)u;
     (void)chat;
+    if (strcmp(id, g_obs.group_id) == 0 && strcmp(type, "delivered") == 0)
+        g_obs.group_delivered = 1;
     if (strcmp(id, g_obs.sent_id) != 0)
         return;
     if (strcmp(type, "sent") == 0)
         g_obs.sent_acked = 1;
     if (strcmp(type, "delivered") == 0)
         g_obs.delivered = 1;
+}
+
+static void ev_chat_name(void *u, const wa_jid *chat, const char *name)
+{
+    (void)u;
+    if (jid_is_group(chat))
+        zstrlcpy(g_obs.chat_name, name, sizeof g_obs.chat_name);
 }
 
 static wa_client g_client;
@@ -933,13 +1109,13 @@ static void test_end_to_end(void)
     wa_set_noise_root_key(g_root.pub);
 
     wa_events ev = {NULL, ev_state, ev_qr, ev_paired, NULL, ev_message,
-                    ev_receipt, NULL};
+                    ev_receipt, ev_chat_name};
     CHECK(wa_client_init(&g_client, &cfg, &ev) == 0);
     CHECK(wa_client_connect(&g_client) == 0);
 
     uint64_t deadline = plat_now_ms() + 30000;
-    int sent = 0;
-    while (plat_now_ms() < deadline && !g_obs.delivered) {
+    int sent = 0, group_sent = 0;
+    while (plat_now_ms() < deadline && !(g_obs.group_delivered && g_obs.group_msg)) {
         struct pollfd p = {wa_client_fd(&g_client), POLLIN, 0};
         int t = wa_client_next_timeout(&g_client);
         if (t < 0 || t > 200)
@@ -958,6 +1134,13 @@ static void test_end_to_end(void)
                                sizeof g_obs.sent_id) == 0);
             sent = 1;
         }
+        if (g_obs.delivered && !group_sent) {
+            wa_jid g;
+            jid_parse(&g, GROUP_JID);
+            CHECK(wa_send_text(&g_client, &g, GROUP_TEXT, g_obs.group_id,
+                               sizeof g_obs.group_id) == 0);
+            group_sent = 1;
+        }
     }
     CHECK(g_obs.qr_count >= 1);
     CHECK(g_obs.paired);
@@ -970,6 +1153,11 @@ static void test_end_to_end(void)
     CHECK(g_obs.sent_acked);
     CHECK(g_obs.delivered);
     CHECK(prekeys_count() > 0);
+    CHECK(g_obs.group_delivered);
+    CHECK(g_obs.group_msg == 1);
+    CHECK_STR(g_obs.group_text, GROUP_IN_TEXT);
+    CHECK_STR(g_obs.group_sender, MARIA_JID);
+    CHECK_STR(g_obs.chat_name, "Familia");
 
     /* credentials persisted: a fresh load sees the pairing */
     wa_device d;

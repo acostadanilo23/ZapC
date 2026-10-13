@@ -537,6 +537,11 @@ static void record_message(const wa_message *m, msg_status st)
     for (char *p = ce->preview; *p; p++)
         if (*p == '\n')
             *p = ' ';
+    if (jid_is_group(&m->chat) && ce->name[0] == '\0' && !ce->name_requested &&
+        g_wa.state == WA_ST_LOGGED_IN) {
+        ce->name_requested = 1;
+        wa_request_group_info(&g_wa, &m->chat);
+    }
     int in_open = a->chat_open && jid_same_user(&a->chat, &m->chat);
     if (!m->from_me && !in_open)
         ce->unread++;
@@ -803,10 +808,6 @@ static void send_text(const char *text)
     int r = wa_send_text(&g_wa, &a->chat, text, id, sizeof id);
     if (r == -2) {
         notice("aguarde o envio anterior terminar");
-        return;
-    }
-    if (r == -3) {
-        notice("envio para grupos ainda n\xc3\xa3o implementado");
         return;
     }
     if (r != 0) {

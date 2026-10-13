@@ -162,6 +162,8 @@ void wa_new_message_id(wa_client *c, char *out, size_t cap);
 /* Send a text message (async; progress reported via on_receipt "sent"). */
 int wa_send_text(wa_client *c, const wa_jid *to, const char *text,
                  char *id_out, size_t id_cap);
+/* Ask the server for a group's subject (reported via on_chat_name). */
+int wa_request_group_info(wa_client *c, const wa_jid *group);
 /* Mark messages as read. */
 int wa_mark_read(wa_client *c, const wa_jid *chat, const wa_jid *sender,
                  const char *msg_id);

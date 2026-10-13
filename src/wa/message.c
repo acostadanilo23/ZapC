@@ -15,7 +15,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_SEND_DEVICES 24
+#define MAX_SEND_DEVICES 128 /* devices per outgoing message */
+#define MAX_GROUP_USERS 96   /* group members resolved per send */
+#define CT_ARENA_SIZE (96u * 1024u)
 
 /* ======================================================================== */
 /* Message protobuf -> display text                                         */
@@ -455,13 +457,17 @@ void wa_upload_prekeys(wa_client *c, unsigned count)
 /* sending                                                                  */
 /* ======================================================================== */
 
-typedef enum { JOB_DEVICES, JOB_PREKEYS } job_stage;
+typedef enum { JOB_GROUP_INFO, JOB_DEVICES, JOB_PREKEYS } job_stage;
 
 typedef struct wa_send_job {
     job_stage stage;
     char id[32];
     wa_jid to;
+    int is_group;
+    int lid_addressing;
     char text[ZAPC_MSG_TEXT_MAX];
+    wa_jid users[MAX_GROUP_USERS];
+    int nusers;
     wa_jid devices[MAX_SEND_DEVICES];
     int ndevices;
 } wa_send_job;
@@ -502,31 +508,66 @@ static size_t build_dsm_proto(const wa_jid *to, const uint8_t *msg,
     return b.overflow ? 0 : b.len;
 }
 
+/* Message{senderKeyDistributionMessage{groupId, axolotlSKDM}} */
+static size_t build_skdm_proto(const wa_jid *group, const uint8_t *skdm,
+                               size_t len, uint8_t *out, size_t cap)
+{
+    char gid[WA_JID_STR_MAX];
+    zbuf b;
+    jid_format(group, gid, sizeof gid);
+    zbuf_init(&b, out, cap);
+    size_t m = pb_begin(&b, 2);
+    pb_put_string(&b, 1, gid);
+    pb_put_bytes(&b, 2, skdm, len);
+    pb_end(&b, m);
+    return b.overflow ? 0 : b.len;
+}
+
+/* Our own identity in the addressing domain used for this message. */
+static void own_identity(const wa_client *c, int lid, wa_jid *out)
+{
+    if (lid && !jid_is_empty(&c->dev.lid))
+        *out = c->dev.lid;
+    else
+        *out = c->dev.jid;
+}
+
 static void request_devices(wa_client *c, wa_send_job *job)
 {
-    char to_s[WA_JID_STR_MAX], me_s[WA_JID_STR_MAX], sid[24];
-    wa_jid to_user, me_user;
-    jid_to_non_ad(&to_user, &job->to);
-    /* use the same addressing (PN or LID) for our own devices */
-    if (strcmp(job->to.server, WA_SERVER_LID) == 0 && !jid_is_empty(&c->dev.lid))
-        jid_to_non_ad(&me_user, &c->dev.lid);
-    else
-        jid_to_non_ad(&me_user, &c->dev.jid);
-    jid_format(&to_user, to_s, sizeof to_s);
-    jid_format(&me_user, me_s, sizeof me_s);
-    wa_new_request_id(c, sid, sizeof sid);
+    static char jids[MAX_GROUP_USERS + 2][WA_JID_STR_MAX];
+    static wa_attr ua[MAX_GROUP_USERS + 2][1];
+    static wa_node users[MAX_GROUP_USERS + 2];
+    char sid[24];
+    size_t n = 0;
+    wa_jid me;
+    own_identity(c, job->lid_addressing, &me);
+    jid_to_non_ad(&me, &me);
 
-    wa_attr ua[2][1] = {{WA_ATTR_JID("jid", to_s)}, {WA_ATTR_JID("jid", me_s)}};
-    wa_node users[2] = {
-        {"user", ua[0], 1, NULL, 0, NULL, 0, WA_CONTENT_NONE},
-        {"user", ua[1], 1, NULL, 0, NULL, 0, WA_CONTENT_NONE},
-    };
+    if (!job->is_group) {
+        jid_to_non_ad(&job->users[0], &job->to);
+        job->nusers = 1;
+    }
+    int have_me = 0;
+    for (int i = 0; i < job->nusers; i++) {
+        if (jid_same_user(&job->users[i], &me))
+            have_me = 1;
+        jid_format(&job->users[i], jids[n], sizeof jids[n]);
+        ua[n][0] = (wa_attr)WA_ATTR_JID("jid", jids[n]);
+        users[n] = (wa_node){"user", ua[n], 1, NULL, 0, NULL, 0, WA_CONTENT_NONE};
+        n++;
+    }
+    if (!have_me) {
+        jid_format(&me, jids[n], sizeof jids[n]);
+        ua[n][0] = (wa_attr)WA_ATTR_JID("jid", jids[n]);
+        users[n] = (wa_node){"user", ua[n], 1, NULL, 0, NULL, 0, WA_CONTENT_NONE};
+        n++;
+    }
+    wa_new_request_id(c, sid, sizeof sid);
     wa_attr da[] = {WA_ATTR("version", "2")};
     wa_node devices = {"devices", da, 1, NULL, 0, NULL, 0, WA_CONTENT_NONE};
     wa_node qkids[2] = {
         {"query", NULL, 0, &devices, 1, NULL, 0, WA_CONTENT_CHILDREN},
-        {"list", NULL, 0, users, jid_same_user(&to_user, &me_user) ? 1u : 2u,
-         NULL, 0, WA_CONTENT_CHILDREN},
+        {"list", NULL, 0, users, n, NULL, 0, WA_CONTENT_CHILDREN},
     };
     wa_attr usa[] = {WA_ATTR("sid", sid), WA_ATTR("mode", "query"),
                      WA_ATTR("last", "true"), WA_ATTR("index", "0"),
@@ -542,6 +583,25 @@ static void request_devices(wa_client *c, wa_send_job *job)
         wa_message_job_abort(c, "cannot query devices");
 }
 
+static int send_group_info_query(wa_client *c, const wa_jid *group, int slot)
+{
+    char g[WA_JID_STR_MAX];
+    jid_format(group, g, sizeof g);
+    wa_attr qa[] = {WA_ATTR("request", "interactive")};
+    wa_node q = {"query", qa, 1, NULL, 0, NULL, 0, WA_CONTENT_NONE};
+    wa_attr a[] = {WA_ATTR("id", ""), WA_ATTR("xmlns", "w:g2"),
+                   WA_ATTR("type", "get"), WA_ATTR_JID("to", g)};
+    wa_node iq = {"iq", a, WA_COUNT(a), &q, 1, NULL, 0, WA_CONTENT_CHILDREN};
+    return wa_send_iq(c, &iq, IQ_GROUP_INFO, slot, NULL, 0);
+}
+
+int wa_request_group_info(wa_client *c, const wa_jid *group)
+{
+    if (c->state != WA_ST_LOGGED_IN || !jid_is_group(group))
+        return -1;
+    return send_group_info_query(c, group, -1);
+}
+
 int wa_send_text(wa_client *c, const wa_jid *to, const char *text,
                  char *id_out, size_t id_cap)
 {
@@ -549,33 +609,82 @@ int wa_send_text(wa_client *c, const wa_jid *to, const char *text,
         return -1;
     if (c->send_job != NULL)
         return -2; /* busy */
-    if (jid_is_group(to)) {
-        LOGW("msg", "sending to groups is not implemented yet");
-        return -3;
-    }
     wa_send_job *job = &g_job;
     memset(job, 0, sizeof *job);
     wa_new_message_id(c, job->id, sizeof job->id);
     jid_to_non_ad(&job->to, to);
+    job->is_group = jid_is_group(to);
+    job->lid_addressing = strcmp(to->server, WA_SERVER_LID) == 0;
     zstrlcpy(job->text, text, sizeof job->text);
     c->send_job = job;
     if (id_out != NULL)
         zstrlcpy(id_out, job->id, id_cap);
-    request_devices(c, job);
+    if (job->is_group) {
+        job->stage = JOB_GROUP_INFO;
+        if (send_group_info_query(c, &job->to, 0) != 0)
+            wa_message_job_abort(c, "cannot query group");
+    } else {
+        request_devices(c, job);
+    }
     return c->send_job != NULL ? 0 : -1;
 }
 
-static void add_device(wa_send_job *job, const wa_jid *user, unsigned dev)
+static void handle_group_info(wa_client *c, const wa_node *iq,
+                              const wa_pending_iq *req)
 {
-    if (job->ndevices >= MAX_SEND_DEVICES)
+    const wa_node *g = wa_node_child(iq, "group");
+    if (g == NULL)
         return;
+    const char *subject = wa_node_attr(g, "subject");
+    const char *gid = wa_node_attr(g, "id");
+    const char *from = wa_node_attr(iq, "from");
+    wa_jid gj;
+    int have_jid = 0;
+    if (from != NULL && jid_parse(&gj, from) == 0 && jid_is_group(&gj))
+        have_jid = 1;
+    else if (gid != NULL && jid_make(&gj, gid, WA_SERVER_GROUP) == 0)
+        have_jid = 1;
+    if (have_jid && subject != NULL && c->ev.on_chat_name != NULL)
+        c->ev.on_chat_name(c->ev.user, &gj, subject);
+
+    wa_send_job *job = c->send_job;
+    if (req->slot < 0 || job == NULL || job->stage != JOB_GROUP_INFO)
+        return;
+    const char *mode = wa_node_attr(g, "addressing_mode");
+    job->lid_addressing = mode != NULL && strcmp(mode, "lid") == 0;
+    job->nusers = 0;
+    for (size_t i = 0; g->content == WA_CONTENT_CHILDREN && i < g->child_count; i++) {
+        const wa_node *p = &g->children[i];
+        const char *js = wa_node_attr(p, "jid");
+        wa_jid pj;
+        if (strcmp(p->tag, "participant") != 0 || js == NULL ||
+            jid_parse(&pj, js) != 0)
+            continue;
+        if (job->nusers >= MAX_GROUP_USERS) {
+            wa_message_job_abort(c, "group too large for this build");
+            return;
+        }
+        jid_to_non_ad(&job->users[job->nusers++], &pj);
+    }
+    if (job->nusers == 0) {
+        wa_message_job_abort(c, "group has no participants");
+        return;
+    }
+    request_devices(c, job);
+}
+
+static int add_device(wa_send_job *job, const wa_jid *user, unsigned dev)
+{
     wa_jid d = *user;
     d.device = (uint16_t)dev;
     d.agent = 0;
     for (int i = 0; i < job->ndevices; i++)
         if (jid_equal(&job->devices[i], &d))
-            return;
+            return 0;
+    if (job->ndevices >= MAX_SEND_DEVICES)
+        return -1;
     job->devices[job->ndevices++] = d;
+    return 0;
 }
 
 static void finish_send(wa_client *c, wa_send_job *job);
@@ -613,7 +722,7 @@ static void request_prekeys(wa_client *c, wa_send_job *job)
 static void handle_usync_result(wa_client *c, const wa_node *iq)
 {
     wa_send_job *job = c->send_job;
-    if (job == NULL)
+    if (job == NULL || job->stage != JOB_DEVICES)
         return;
     const wa_node *list = wa_node_path(iq, "usync", "list", NULL);
     for (size_t i = 0; list != NULL && list->content == WA_CONTENT_CHILDREN &&
@@ -637,19 +746,19 @@ static void handle_usync_result(wa_client *c, const wa_node *iq)
                 continue;
             if (hosted != NULL && strcmp(hosted, "true") == 0)
                 continue;
-            unsigned dev = (unsigned)strtoul(ids, NULL, 10);
+            unsigned long dev = strtoul(ids, NULL, 10);
             if (dev > 0xFFFF)
                 continue;
-            /* skip ourselves */
             if (is_me && dev == c->dev.jid.device)
-                continue;
-            add_device(job, &uj, dev);
+                continue; /* ourselves */
+            if (add_device(job, &uj, (unsigned)dev) != 0) {
+                wa_message_job_abort(c, "too many devices for this build");
+                return;
+            }
         }
     }
-    if (job->ndevices == 0) {
-        /* no device list: fall back to the main device */
-        add_device(job, &job->to, 0);
-    }
+    if (job->ndevices == 0 && !job->is_group)
+        add_device(job, &job->to, 0); /* fall back to the main device */
     LOGD("msg", "sending to %d devices", job->ndevices);
     request_prekeys(c, job);
 }
@@ -677,7 +786,7 @@ static int parse_key_node(const wa_node *n, uint32_t *id, uint8_t pub[32],
 static void handle_prekey_result(wa_client *c, const wa_node *iq)
 {
     wa_send_job *job = c->send_job;
-    if (job == NULL)
+    if (job == NULL || job->stage != JOB_PREKEYS)
         return;
     const wa_node *list = wa_node_child(iq, "list");
     for (size_t i = 0; list != NULL && list->content == WA_CONTENT_CHILDREN &&
@@ -716,48 +825,123 @@ static void handle_prekey_result(wa_client *c, const wa_node *iq)
     finish_send(c, job);
 }
 
+static int cmp_str(const void *a, const void *b)
+{
+    return strcmp((const char *)a, (const char *)b);
+}
+
+/* phash = "2:" + base64(sha256(sorted "user.agent:device@server")[:6]) */
+static void participant_hash(const wa_send_job *job, const wa_jid *self,
+                             char *out, size_t cap)
+{
+    static char list[MAX_SEND_DEVICES + 1][WA_JID_STR_MAX];
+    int n = 0;
+    for (int i = 0; i < job->ndevices; i++, n++)
+        snprintf(list[n], sizeof list[n], "%s.%u:%u@%s", job->devices[i].user,
+                 (unsigned)job->devices[i].agent, (unsigned)job->devices[i].device,
+                 job->devices[i].server);
+    snprintf(list[n], sizeof list[n], "%s.0:%u@%s", self->user,
+             (unsigned)self->device, self->server);
+    n++;
+    qsort(list, (size_t)n, sizeof list[0], cmp_str);
+    zc_iov parts[MAX_SEND_DEVICES + 1];
+    for (int i = 0; i < n; i++) {
+        parts[i].data = list[i];
+        parts[i].len = strlen(list[i]);
+    }
+    uint8_t hash[32];
+    char b64[16];
+    crypto_sha256_v(parts, (size_t)n, hash);
+    base64_encode(hash, 6, b64, sizeof b64); /* 6 bytes: no padding */
+    snprintf(out, cap, "2:%s", b64);
+}
+
 static void finish_send(wa_client *c, wa_send_job *job)
 {
     static uint8_t msg[ZAPC_MSG_TEXT_MAX + 64];
     static uint8_t dsm[ZAPC_MSG_TEXT_MAX + 256];
+    static uint8_t skdm_msg[512];
     static uint8_t pad[ZAPC_MSG_TEXT_MAX + 256 + 16];
-    static uint8_t cts[MAX_SEND_DEVICES][ZAPC_MSG_TEXT_MAX + 512];
+    static uint8_t ct_mem[CT_ARENA_SIZE];
+    static uint8_t skmsg[ZAPC_MSG_TEXT_MAX + 256];
     static char jids[MAX_SEND_DEVICES][WA_JID_STR_MAX];
     static wa_attr enc_attrs[MAX_SEND_DEVICES][2];
     static wa_attr to_attrs[MAX_SEND_DEVICES][1];
     static wa_node encs[MAX_SEND_DEVICES];
     static wa_node tos[MAX_SEND_DEVICES];
+    zap_arena cta;
+    zap_arena_init(&cta, ct_mem, sizeof ct_mem);
+
+    wa_jid self;
+    own_identity(c, job->lid_addressing, &self);
+    char own_addr[96];
+    jid_signal_address(&self, own_addr, sizeof own_addr);
+    char group_s[WA_JID_STR_MAX];
+    jid_format(&job->to, group_s, sizeof group_s);
 
     size_t mlen = build_message_proto(job->text, msg, sizeof msg);
-    size_t dlen = build_dsm_proto(&job->to, msg, mlen, dsm, sizeof dsm);
-    if (mlen == 0 || dlen == 0) {
+    size_t dlen = 0, slen = 0;
+    long sklen = 0;
+    if (mlen == 0) {
         wa_message_job_abort(c, "message too long");
         return;
     }
+    if (job->is_group) {
+        uint8_t dist[256];
+        long dl = senderkey_distribution(group_s, own_addr, dist, sizeof dist);
+        slen = dl > 0 ? build_skdm_proto(&job->to, dist, (size_t)dl, skdm_msg,
+                                         sizeof skdm_msg)
+                      : 0;
+        memcpy(pad, msg, mlen);
+        size_t padded = wa_pad_message(pad, mlen, sizeof pad);
+        sklen = padded ? senderkey_encrypt(group_s, own_addr, pad, padded,
+                                           skmsg, sizeof skmsg)
+                       : -1;
+        if (slen == 0 || sklen < 0) {
+            wa_message_job_abort(c, "sender key encryption failed");
+            return;
+        }
+    } else {
+        dlen = build_dsm_proto(&job->to, msg, mlen, dsm, sizeof dsm);
+        if (dlen == 0) {
+            wa_message_job_abort(c, "message too long");
+            return;
+        }
+    }
+
     size_t n = 0;
-    int include_identity = 0;
+    int include_identity = 0, reached_other = 0;
     for (int i = 0; i < job->ndevices; i++) {
         const wa_jid *d = &job->devices[i];
         char addr[96];
         int is_own = own_user(c, d);
-        const uint8_t *pt = is_own ? dsm : msg;
-        size_t plen = is_own ? dlen : mlen;
+        const uint8_t *pt = job->is_group ? skdm_msg : is_own ? dsm : msg;
+        size_t plen = job->is_group ? slen : is_own ? dlen : mlen;
         memcpy(pad, pt, plen);
         size_t padded = wa_pad_message(pad, plen, sizeof pad);
         int pkmsg = 0;
         if (padded == 0 || jid_signal_address(d, addr, sizeof addr) < 0)
             continue;
-        long ct = signal_encrypt(&c->dev, addr, pad, padded, cts[n],
-                                 sizeof cts[n], &pkmsg);
-        if (ct < 0) {
+        size_t room = cta.cap - cta.used;
+        if (room < padded + 512) {
+            LOGW("msg", "ciphertext buffer full, skipping remaining devices");
+            break;
+        }
+        uint8_t *ct = zap_arena_alloc(&cta, padded + 512);
+        long ctl = ct != NULL ? signal_encrypt(&c->dev, addr, pad, padded, ct,
+                                               padded + 512, &pkmsg)
+                              : -1;
+        if (ctl < 0) {
             LOGD("msg", "no session with %s, skipping device", addr);
             continue;
         }
         include_identity |= pkmsg;
+        if (!is_own)
+            reached_other = 1;
         jid_format(d, jids[n], sizeof jids[n]);
         enc_attrs[n][0] = (wa_attr)WA_ATTR("v", "2");
         enc_attrs[n][1] = (wa_attr)WA_ATTR("type", pkmsg ? "pkmsg" : "msg");
-        encs[n] = (wa_node){"enc", enc_attrs[n], 2, NULL, 0, cts[n], (size_t)ct,
+        encs[n] = (wa_node){"enc", enc_attrs[n], 2, NULL, 0, ct, (size_t)ctl,
                             WA_CONTENT_BYTES};
         to_attrs[n][0] = (wa_attr)WA_ATTR_JID("jid", jids[n]);
         tos[n] = (wa_node){"to", to_attrs[n], 1, &encs[n], 1, NULL, 0,
@@ -765,30 +949,38 @@ static void finish_send(wa_client *c, wa_send_job *job)
         n++;
     }
     zap_secure_zero(pad, sizeof pad);
-    int to_ok = 0;
-    for (size_t i = 0; i < n; i++)
-        if (!own_user(c, &job->devices[i]))
-            to_ok = 1;
-    if (!to_ok) {
+    if (!reached_other && !job->is_group) {
         wa_message_job_abort(c, "no session with recipient");
         return;
     }
-    char to_s[WA_JID_STR_MAX];
-    jid_format(&job->to, to_s, sizeof to_s);
-    wa_node content[2] = {
-        {"participants", NULL, 0, tos, n, NULL, 0, WA_CONTENT_CHILDREN},
-        {"device-identity", NULL, 0, NULL, 0, c->dev.account,
-         c->dev.account_len, WA_CONTENT_BYTES},
-    };
+
+    wa_node content[3];
+    size_t nc = 0;
+    content[nc++] = (wa_node){"participants", NULL, 0, tos, n, NULL, 0,
+                              WA_CONTENT_CHILDREN};
+    wa_attr ska[] = {WA_ATTR("v", "2"), WA_ATTR("type", "skmsg")};
+    if (job->is_group)
+        content[nc++] = (wa_node){"enc", ska, 2, NULL, 0, skmsg, (size_t)sklen,
+                                  WA_CONTENT_BYTES};
+    if (include_identity)
+        content[nc++] = (wa_node){"device-identity", NULL, 0, NULL, 0,
+                                  c->dev.account, c->dev.account_len,
+                                  WA_CONTENT_BYTES};
+    char phash[32] = "";
+    if (job->is_group)
+        participant_hash(job, &self, phash, sizeof phash);
     wa_attr a[] = {WA_ATTR("id", job->id), WA_ATTR("type", "text"),
-                   WA_ATTR_JID("to", to_s)};
-    wa_node m = {"message", a, WA_COUNT(a), content,
-                 include_identity ? 2u : 1u, NULL, 0, WA_CONTENT_CHILDREN};
+                   WA_ATTR_JID("to", group_s), WA_ATTR("phash", phash),
+                   WA_ATTR("addressing_mode", job->lid_addressing && job->is_group
+                                                  ? "lid"
+                                                  : "")};
+    wa_node m = {"message", a, WA_COUNT(a), content, nc, NULL, 0,
+                 WA_CONTENT_CHILDREN};
     if (wa_send_node(c, &m) != 0) {
         wa_message_job_abort(c, "send failed");
         return;
     }
-    LOGI("msg", "message %s sent to %zu devices", job->id, n);
+    LOGI("msg", "message %s sent (%zu device envelopes)", job->id, n);
     c->send_job = NULL;
 }
 
@@ -819,6 +1011,9 @@ void wa_handle_iq_result(wa_client *c, const wa_node *node,
         c->dev.uploaded_prekey_id = c->dev.next_prekey_id;
         credentials_save(&c->dev);
         LOGI("wa", "prekeys uploaded");
+        break;
+    case IQ_GROUP_INFO:
+        handle_group_info(c, node, req);
         break;
     case IQ_USYNC_DEVICES:
         handle_usync_result(c, node);

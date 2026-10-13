@@ -23,6 +23,7 @@ typedef struct {
     int64_t last_ts;
     unsigned unread;
     char preview[CHAT_PREVIEW_MAX];
+    uint8_t name_requested; /* RAM only: group subject query sent */
 } chat_entry;
 
 typedef struct {
