@@ -93,6 +93,14 @@ int http_get(const char *host, uint16_t port, const char *path,
              const char *ca_file, uint64_t max_body, http_body_fn cb,
              void *user, int timeout_ms)
 {
+    return http_get_ex(host, port, path, ca_file, NULL, max_body, cb, user,
+                       timeout_ms);
+}
+
+int http_get_ex(const char *host, uint16_t port, const char *path,
+                const char *ca_file, const char *headers, uint64_t max_body,
+                http_body_fn cb, void *user, int timeout_ms)
+{
     static http_conn conn;
     http_conn *h = &conn;
     char line[1024];
@@ -112,11 +120,13 @@ int http_get(const char *host, uint16_t port, const char *path,
     int n = snprintf(req, sizeof req,
                      "GET %s HTTP/1.1\r\n"
                      "Host: %s\r\n"
-                     "User-Agent: ZapC\r\n"
                      "Accept: */*\r\n"
-                     "Origin: https://web.whatsapp.com\r\n"
+                     "%s"
                      "Connection: close\r\n\r\n",
-                     path, host);
+                     path, host,
+                     headers != NULL ? headers
+                                     : "User-Agent: ZapC\r\n"
+                                       "Origin: https://web.whatsapp.com\r\n");
     if (n < 0 || (size_t)n >= sizeof req ||
         tls_write(h->tls, req, (size_t)n) != n)
         goto out;

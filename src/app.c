@@ -766,8 +766,8 @@ static void cmd_status(void)
                g_wa.frames_rx, g_wa.frames_tx, g_wa.bytes_rx, g_wa.bytes_tx);
     app_printf("Servidor: %s:%u%s  vers\xc3\xa3o WA %u.%u.%u", g_app.cfg.wa_host,
                (unsigned)g_app.cfg.wa_port, g_app.cfg.wa_path,
-               (unsigned)g_app.cfg.wa_version[0], (unsigned)g_app.cfg.wa_version[1],
-               (unsigned)g_app.cfg.wa_version[2]);
+               (unsigned)g_wa.version[0], (unsigned)g_wa.version[1],
+               (unsigned)g_wa.version[2]);
     app_printf("Estado salvo em: %s", storage_dir());
 }
 

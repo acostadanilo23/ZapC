@@ -21,5 +21,10 @@ typedef int (*http_body_fn)(void *user, const uint8_t *data, size_t len);
 int http_get(const char *host, uint16_t port, const char *path,
              const char *ca_file, uint64_t max_body, http_body_fn cb,
              void *user, int timeout_ms);
+/* Same, with custom request headers ("Name: value\r\n"...) replacing the
+ * default User-Agent/Origin headers. */
+int http_get_ex(const char *host, uint16_t port, const char *path,
+                const char *ca_file, const char *headers, uint64_t max_body,
+                http_body_fn cb, void *user, int timeout_ms);
 
 #endif

@@ -102,6 +102,8 @@ struct wa_send_job; /* defined in message.c */
 typedef struct wa_client {
     const zapc_config *cfg;
     wa_events ev;
+    uint32_t version[3]; /* WhatsApp Web version announced */
+    int version_fetched;
     wa_device dev;
     int have_device;
 
@@ -194,6 +196,9 @@ int wa_request_group_info(wa_client *c, const wa_jid *group);
 /* Mark messages as read. */
 int wa_mark_read(wa_client *c, const wa_jid *chat, const wa_jid *sender,
                  const char *msg_id);
+
+/* Fetch the current WhatsApp Web version from web.whatsapp.com/sw.js. */
+int wa_fetch_latest_version(wa_client *c);
 
 /* Testing only: verify the server certificate chain against another root. */
 void wa_set_noise_root_key(const uint8_t key[32]);

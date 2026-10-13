@@ -4,6 +4,7 @@
  */
 #include "zapc/wa.h"
 #include "zapc/crypto.h"
+#include "zapc/http.h"
 #include "zapc/inflate.h"
 #include "zapc/log.h"
 #include "zapc/platform.h"
@@ -237,7 +238,7 @@ static void put_user_agent(wa_client *c, zbuf *b)
 {
     size_t m = pb_begin(b, 5);
     pb_put_uint(b, 1, 14); /* platform = WEB */
-    put_app_version(b, 2, c->cfg->wa_version);
+    put_app_version(b, 2, c->version);
     pb_put_string(b, 3, "000");      /* mcc */
     pb_put_string(b, 4, "000");      /* mnc */
     pb_put_string(b, 5, "0.1");      /* osVersion */
@@ -303,9 +304,8 @@ static size_t build_client_payload(wa_client *c, uint8_t *out, size_t cap)
         uint8_t build_hash[16];
         uint8_t regid[4], skid[4];
         uint8_t keytype = WA_KEY_TYPE_DJB;
-        snprintf(ver, sizeof ver, "%u.%u.%u", (unsigned)c->cfg->wa_version[0],
-                 (unsigned)c->cfg->wa_version[1],
-                 (unsigned)c->cfg->wa_version[2]);
+        snprintf(ver, sizeof ver, "%u.%u.%u", (unsigned)c->version[0],
+                 (unsigned)c->version[1], (unsigned)c->version[2]);
         crypto_md5(ver, strlen(ver), build_hash);
         wr_be32(regid, c->dev.registration_id);
         wr_be32(skid, c->dev.signed_prekey_id);
@@ -617,8 +617,13 @@ static void handle_failure(wa_client *c, const wa_node *n)
                                  : "device was unlinked");
         break;
     case 405:
-        LOGE("wa", "client version outdated; set wa_version in config");
-        c->want_connected = 0;
+        LOGW("wa", "client version %u.%u.%u rejected as outdated",
+             (unsigned)c->version[0], (unsigned)c->version[1],
+             (unsigned)c->version[2]);
+        if (c->version_fetched || wa_fetch_latest_version(c) != 0) {
+            LOGE("wa", "cannot find a newer version; set wa_version in config");
+            c->want_connected = 0;
+        }
         break;
     case 402:
         LOGE("wa", "account temporarily banned");
@@ -850,6 +855,97 @@ static int on_ws_message(void *user, int opcode, const uint8_t *data,
 }
 
 /* ======================================================================== */
+/* version discovery                                                        */
+/* ======================================================================== */
+
+typedef struct {
+    char tail[64];
+    size_t tail_len;
+    uint32_t revision;
+} rev_scan;
+
+/* Look for `client_revision` followed by digits, across chunk boundaries. */
+static int scan_revision(void *user, const uint8_t *data, size_t len)
+{
+    static const char key[] = "client_revision";
+    rev_scan *r = user;
+    if (r->revision != 0)
+        return 0;
+    char win[64 + 4096];
+    size_t off = 0;
+    while (off < len) {
+        size_t take = len - off < 4096 ? len - off : 4096;
+        memcpy(win, r->tail, r->tail_len);
+        memcpy(win + r->tail_len, data + off, take);
+        size_t wl = r->tail_len + take;
+        off += take;
+        for (size_t i = 0; i + sizeof key - 1 < wl; i++) {
+            if (memcmp(win + i, key, sizeof key - 1) != 0)
+                continue;
+            size_t j = i + sizeof key - 1;
+            while (j < wl && (win[j] < '0' || win[j] > '9') && j - i < 40)
+                j++;
+            uint64_t v = 0;
+            size_t digits = 0;
+            while (j < wl && win[j] >= '0' && win[j] <= '9' && digits < 10) {
+                v = v * 10 + (uint64_t)(win[j++] - '0');
+                digits++;
+            }
+            if (digits > 0 && j < wl && v > 0 && v <= UINT32_MAX) {
+                r->revision = (uint32_t)v;
+                return 0;
+            }
+        }
+        r->tail_len = wl < sizeof r->tail ? wl : sizeof r->tail;
+        memcpy(r->tail, win + wl - r->tail_len, r->tail_len);
+    }
+    return 0;
+}
+
+int wa_fetch_latest_version(wa_client *c)
+{
+    rev_scan r;
+    memset(&r, 0, sizeof r);
+    c->version_fetched = 1;
+    LOGI("wa", "fetching current WhatsApp Web version");
+    int st = http_get_ex("web.whatsapp.com", 443, "/sw.js", c->cfg->ca_file,
+                         "User-Agent: Mozilla/5.0 (X11; Linux x86_64) "
+                         "AppleWebKit/537.36 (KHTML, like Gecko) "
+                         "Chrome/131.0.0.0 Safari/537.36\r\n"
+                         "Sec-Fetch-Site: none\r\n",
+                         4u * 1024u * 1024u, scan_revision, &r, 20000);
+    if (st != 200 || r.revision == 0) {
+        LOGW("wa", "could not determine the current version");
+        return -1;
+    }
+    c->version[0] = 2;
+    c->version[1] = 3000;
+    c->version[2] = r.revision;
+    char path[ZAPC_PATH_MAX], txt[48];
+    int n = snprintf(txt, sizeof txt, "2.3000.%u\n", (unsigned)r.revision);
+    if (storage_path(path, sizeof path, "wa_version") == 0 && n > 0)
+        plat_write_file_atomic(path, txt, (size_t)n, 0600);
+    LOGI("wa", "using WhatsApp Web version 2.3000.%u", (unsigned)r.revision);
+    return 0;
+}
+
+static void load_saved_version(wa_client *c)
+{
+    char path[ZAPC_PATH_MAX], txt[48];
+    unsigned long a, b, v;
+    memcpy(c->version, c->cfg->wa_version, sizeof c->version);
+    if (storage_path(path, sizeof path, "wa_version") != 0)
+        return;
+    long n = plat_read_file(path, txt, sizeof txt - 1);
+    if (n <= 0)
+        return;
+    txt[n] = '\0';
+    if (sscanf(txt, "%lu.%lu.%lu", &a, &b, &v) == 3 && a == c->version[0] &&
+        b == c->version[1] && v > c->version[2] && v <= UINT32_MAX)
+        c->version[2] = (uint32_t)v;
+}
+
+/* ======================================================================== */
 /* public API                                                               */
 /* ======================================================================== */
 
@@ -870,6 +966,7 @@ int wa_client_init(wa_client *c, const zapc_config *cfg, const wa_events *ev)
     snprintf(c->id_prefix, sizeof c->id_prefix, "%u.%u-", (unsigned)rnd[0],
              (unsigned)rnd[1]);
 
+    load_saved_version(c);
     int r = credentials_load(&c->dev);
     if (r == 1 || r < 0) {
         if (r < 0)
