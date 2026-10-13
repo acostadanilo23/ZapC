@@ -1441,6 +1441,10 @@ static void test_end_to_end(void)
     CHECK_STR(d.jid.user, PHONE_USER);
     CHECK_STR(d.lid.user, "777");
 
+    plat_mem_stats ms;
+    if (plat_mem_stats_get(&ms) == 0)
+        fprintf(stderr, "  client process: RSS %lu KiB, peak RSS %lu KiB\n",
+                ms.rss_kb, ms.peak_rss_kb);
     wa_client_free(&g_client);
     int status = 0;
     waitpid(pid, &status, 0);

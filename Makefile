@@ -89,7 +89,7 @@ BIN      = $(BUILD)/zapc
 TEST_SRC = $(wildcard tests/test_*.c)
 TEST_BIN = $(TEST_SRC:tests/%.c=$(BUILD)/tests/%)
 
-.PHONY: all debug release test clean interop
+.PHONY: all debug release test clean interop fuzz
 
 all: $(BIN)
 	@ln -sf $(BIN) zapc
@@ -129,6 +129,18 @@ $(BUILD)/sigtool: tools/interop/sigtool.c $(LIB)
 
 interop: $(BUILD)/sigtool
 	PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python $(PYTHON) tools/interop/interop.py $(BUILD)/sigtool $(BUILD)/interop-run
+
+# libFuzzer targets (clang only): node, ws, protobuf, jid, history
+FUZZ_NAMES = node ws protobuf jid history
+fuzz:
+	@mkdir -p build/fuzz
+	@i=1; for t in $(FUZZ_NAMES); do \
+		clang -std=c17 -g -O1 -Iinclude -D_POSIX_C_SOURCE=200809L -DFUZZ_TARGET=$$i \
+			-fsanitize=fuzzer,address,undefined -o build/fuzz/fuzz_$$t \
+			tests/fuzz/fuzz_targets.c $(filter-out src/app.c src/terminal.c,$(CORE_SRC)) \
+			$(LIBS) || exit 1; \
+		i=$$((i+1)); \
+	done; echo "fuzzers in build/fuzz/"
 
 clean:
 	rm -rf build zapc
