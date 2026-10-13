@@ -123,6 +123,17 @@ static void notice(const char *fmt, ...)
 static void log_sink(void *user, log_level lvl, const char *line)
 {
     (void)user;
+    /* history sync progress goes to the console so the user sees it */
+    if (lvl == LOG_INFO && strstr(line, "history") != NULL) {
+        const char *msg = line;
+        for (int sp = 0; sp < 2 && msg != NULL; sp++) {
+            msg = strchr(msg, ' ');
+            while (msg != NULL && *msg == ' ')
+                msg++;
+        }
+        app_printf("* %s", msg ? msg : line);
+        return;
+    }
     if (lvl <= LOG_WARN && term_is_interactive()) {
         /* skip the "LEVEL module " prefix */
         const char *msg = line;
@@ -559,6 +570,8 @@ static void record_message(const wa_message *m, msg_status st)
 /* WhatsApp events                                                          */
 /* ======================================================================== */
 
+static void cmd_chats(void);
+
 static void ev_state(void *user, wa_state st, const char *detail)
 {
     (void)user;
@@ -573,6 +586,15 @@ static void ev_state(void *user, wa_state st, const char *detail)
         g_app.show_qr = 0;
         app_printf("Conectado.");
         notice("conectado");
+        if (!g_app.chat_open) {
+            if (g_app.chats.count > 0) {
+                cmd_chats();
+                app_printf("Digite /open <n\xc3\xbamero> para abrir uma conversa.");
+            } else {
+                app_printf("Aguardando o celular enviar o hist\xc3\xb3rico (pode levar "
+                           "alguns minutos; deixe o WhatsApp aberto no celular).");
+            }
+        }
         break;
     case WA_ST_DISCONNECTED:
         app_printf("Desconectado%s%s.", detail ? ": " : "", detail ? detail : "");
@@ -725,6 +747,11 @@ static void ev_history_done(void *user, unsigned chats, unsigned messages)
     (void)user;
     notice("hist\xc3\xb3rico sincronizado: %u conversas, %u mensagens", chats,
            messages);
+    if (!g_app.chat_open && chats > 0) {
+        g_app.show_qr = 0;
+        cmd_chats();
+        app_printf("Digite /open <n\xc3\xbamero> para abrir uma conversa.");
+    }
 }
 
 /* ======================================================================== */

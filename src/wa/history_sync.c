@@ -314,6 +314,7 @@ void wa_history_run_pending(wa_client *c)
         }
         char tmp[ZAPC_PATH_MAX];
         wa_media_keys keys;
+        LOGI("history", "downloading history sync from %s...", hosts[0]);
         wa_media_ref ref = {job.direct_path,
                             job.has_enc_sha256 ? job.enc_sha256 : NULL,
                             WA_MEDIA_HISTORY_MMS, ZAPC_HISTORY_BLOB_MAX};
