@@ -1171,6 +1171,76 @@ static int run_server(int lfd)
         fprintf(stderr, "  [server] history blob served (%ld bytes)\n", el);
     }
 
+    /* ---------------- retry receipts from Maria ---------------- */
+    storage_init(addr_dir_maria);
+    for (int round = 1; round <= 2; round++) {
+        uint8_t reg[4];
+        wr_be32(reg, maria.registration_id);
+        char rcount[4];
+        snprintf(rcount, sizeof rcount, "%d", round);
+        wa_attr ra2[] = {WA_ATTR("count", rcount), WA_ATTR("id", out_id),
+                         WA_ATTR("t", tbuf), WA_ATTR("v", "1")};
+        /* round 2 carries a fresh bundle: the client must rebuild the session */
+        wa_keypair otk2;
+        curve25519_keypair(otk2.priv, otk2.pub);
+        if (round == 2)
+            prekeys_append(99, otk2.priv);
+        uint8_t spid[3] = {0, 0, 1}, pid[3] = {0, 0, 99}, type = 5;
+        wa_node sk[3] = {
+            {"id", NULL, 0, NULL, 0, spid, 3, WA_CONTENT_BYTES},
+            {"value", NULL, 0, NULL, 0, maria.signed_prekey.pub, 32, WA_CONTENT_BYTES},
+            {"signature", NULL, 0, NULL, 0, maria.signed_prekey_sig, 64, WA_CONTENT_BYTES},
+        };
+        wa_node kk[2] = {
+            {"id", NULL, 0, NULL, 0, pid, 3, WA_CONTENT_BYTES},
+            {"value", NULL, 0, NULL, 0, otk2.pub, 32, WA_CONTENT_BYTES},
+        };
+        wa_node keys_kids[4] = {
+            {"type", NULL, 0, NULL, 0, &type, 1, WA_CONTENT_BYTES},
+            {"identity", NULL, 0, NULL, 0, maria.identity_key.pub, 32, WA_CONTENT_BYTES},
+            {"key", NULL, 0, kk, 2, NULL, 0, WA_CONTENT_CHILDREN},
+            {"skey", NULL, 0, sk, 3, NULL, 0, WA_CONTENT_CHILDREN},
+        };
+        wa_node kids[3] = {
+            {"retry", ra2, 4, NULL, 0, NULL, 0, WA_CONTENT_NONE},
+            {"registration", NULL, 0, NULL, 0, reg, 4, WA_CONTENT_BYTES},
+            {"keys", NULL, 0, keys_kids, 4, NULL, 0, WA_CONTENT_CHILDREN},
+        };
+        char rid[16];
+        snprintf(rid, sizeof rid, "RETRY%d", round);
+        wa_attr rra[] = {WA_ATTR_JID("from", MARIA_JID), WA_ATTR("id", rid),
+                         WA_ATTR("type", "retry"), WA_ATTR("t", tbuf)};
+        wa_node rr = {"receipt", rra, 4, kids, round == 2 ? 3u : 2u, NULL, 0,
+                      WA_CONTENT_CHILDREN};
+        send_node(c, &rr);
+        wa_node *again = expect_node(c, "message", NULL);
+        const wa_node *e = wa_node_child(again, "enc");
+        if (strcmp(wa_node_attr(again, "id"), out_id) != 0 || e == NULL ||
+            strcmp(wa_node_attr(e, "count"), rcount) != 0 ||
+            strcmp(wa_node_attr(again, "device_fanout"), "false") != 0)
+            die("bad retry resend %d", round);
+        const char *et = wa_node_attr(e, "type");
+        if (strcmp(et, round == 1 ? "msg" : "pkmsg") != 0)
+            die("retry %d: unexpected enc type %s", round, et);
+        static uint8_t plain[4096];
+        long n = signal_decrypt(&maria, CLIENT_ADDR, round == 2, e->data,
+                                e->data_len, plain, sizeof plain);
+        if (n < 0)
+            die("Maria cannot decrypt retry %d", round);
+        n = wa_unpad_message(plain, (size_t)n);
+        const uint8_t *txt;
+        size_t tl;
+        if (pb_find_bytes(plain, (size_t)n, 1, &txt, &tl) != 1 ||
+            tl != strlen(REPLY_TEXT) || memcmp(txt, REPLY_TEXT, tl) != 0)
+            die("retry %d text mismatch", round);
+    }
+    fprintf(stderr, "  [server] retry receipts answered (existing and new session)\n");
+    {
+        wa_attr da2[] = {WA_ATTR_JID("from", MARIA_JID), WA_ATTR("id", "RETRYDONE")};
+        wa_node done = {"receipt", da2, 2, NULL, 0, NULL, 0, WA_CONTENT_NONE};
+        send_node(c, &done);
+    }
+
     /* stay until the client hangs up */
     uint8_t tmp[16];
     while (SSL_read(c->ssl, tmp, sizeof tmp) > 0) {
@@ -1201,6 +1271,7 @@ typedef struct {
     char group_sender[64];
     char chat_name[64];
     int hist_done;
+    int retry_done;
     unsigned hist_chats, hist_messages;
     int maria_n;
     char maria_first[64], maria_last[64], maria_name[64];
@@ -1264,6 +1335,8 @@ static void ev_receipt(void *u, const wa_jid *chat, const char *id,
     (void)chat;
     if (strcmp(id, g_obs.group_id) == 0 && strcmp(type, "delivered") == 0)
         g_obs.group_delivered = 1;
+    if (strcmp(id, "RETRYDONE") == 0)
+        g_obs.retry_done = 1;
     if (strcmp(id, g_obs.sent_id) != 0)
         return;
     if (strcmp(type, "sent") == 0)
@@ -1374,7 +1447,8 @@ static void test_end_to_end(void)
     uint64_t deadline = plat_now_ms() + 30000;
     int sent = 0, group_sent = 0;
     while (plat_now_ms() < deadline &&
-           !(g_obs.group_delivered && g_obs.group_msg && g_obs.hist_done)) {
+           !(g_obs.group_delivered && g_obs.group_msg && g_obs.hist_done &&
+             g_obs.retry_done)) {
         struct pollfd p = {wa_client_fd(&g_client), POLLIN, 0};
         int t = wa_client_next_timeout(&g_client);
         if (t < 0 || t > 200)
@@ -1419,6 +1493,7 @@ static void test_end_to_end(void)
     CHECK_STR(g_obs.chat_name, "Familia");
     /* history sync */
     CHECK(g_obs.hist_done);
+    CHECK(g_obs.retry_done);
     CHECK(g_obs.hist_chats == 2);
     CHECK(g_obs.hist_messages == HIST_MSGS + 1);
     CHECK(g_obs.maria_n == ZAPC_HISTORY_PER_CHAT);

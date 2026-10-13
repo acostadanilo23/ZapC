@@ -409,6 +409,228 @@ void wa_handle_message(wa_client *c, const wa_node *node)
     wa_send_ack(c, node, NULL);
 }
 
+/* ======================================================================== */
+/* retry receipts (a recipient device could not decrypt our message)        */
+/* ======================================================================== */
+
+#define SENT_RING 16
+#define MAX_RETRIES_PER_MSG 5
+
+typedef struct {
+    char id[32];
+    wa_jid chat;
+    int is_group;
+    int64_t ts;
+    unsigned retries;
+    char text[ZAPC_MSG_TEXT_MAX];
+} sent_msg;
+
+static sent_msg g_sent[SENT_RING];
+static unsigned g_sent_head;
+
+static void remember_sent(const char *id, const wa_jid *chat, int is_group,
+                          const char *text)
+{
+    sent_msg *s = &g_sent[g_sent_head++ % SENT_RING];
+    zstrlcpy(s->id, id, sizeof s->id);
+    s->chat = *chat;
+    s->is_group = is_group;
+    s->ts = plat_time_unix();
+    s->retries = 0;
+    zstrlcpy(s->text, text, sizeof s->text);
+}
+
+static sent_msg *find_sent(const char *id)
+{
+    for (unsigned i = 0; i < SENT_RING; i++)
+        if (g_sent[i].id[0] != '\0' && strcmp(g_sent[i].id, id) == 0)
+            return &g_sent[i];
+    return NULL;
+}
+
+/* One retry may wait for a prekey fetch at a time. */
+static struct {
+    int active;
+    char msg_id[32];
+    char to[WA_JID_STR_MAX];
+    char participant[WA_JID_STR_MAX];
+    char t[24];
+    wa_jid device;
+    unsigned count;
+    uint64_t started;
+} g_retry;
+
+static int parse_key_node(const wa_node *n, uint32_t *id, uint8_t pub[32],
+                          uint8_t *sig);
+
+/* Bundle from a node holding <registration> and <keys>/<identity>... */
+static int bundle_from_node(const wa_node *u, sig_bundle *b)
+{
+    memset(b, 0, sizeof *b);
+    const wa_node *reg = wa_node_child(u, "registration");
+    const wa_node *keys = wa_node_child(u, "keys");
+    if (keys == NULL)
+        keys = u;
+    const wa_node *ident = wa_node_child(keys, "identity");
+    if (reg == NULL || reg->content != WA_CONTENT_BYTES || reg->data_len != 4 ||
+        ident == NULL || ident->content != WA_CONTENT_BYTES || ident->data_len != 32)
+        return -1;
+    b->registration_id = rd_be32(reg->data);
+    memcpy(b->identity, ident->data, 32);
+    if (parse_key_node(wa_node_child(keys, "skey"), &b->signed_prekey_id,
+                       b->signed_prekey, b->signed_prekey_sig) != 0)
+        return -1;
+    const wa_node *k = wa_node_child(keys, "key");
+    if (k == NULL || parse_key_node(k, &b->prekey_id, b->prekey, NULL) != 0)
+        b->prekey_id = SIG_NO_PREKEY;
+    return 0;
+}
+
+static size_t build_message_proto(const char *text, uint8_t *out, size_t cap);
+static size_t build_dsm_proto(const wa_jid *to, const uint8_t *msg,
+                              size_t mlen, uint8_t *out, size_t cap);
+static void own_identity(const wa_client *c, int lid, wa_jid *out);
+
+static void resend_for_retry(wa_client *c)
+{
+    static uint8_t pt[ZAPC_MSG_TEXT_MAX + 512], pad[ZAPC_MSG_TEXT_MAX + 600];
+    static uint8_t ct[ZAPC_MSG_TEXT_MAX + 1200];
+    sent_msg *sm = find_sent(g_retry.msg_id);
+    char addr[96];
+    g_retry.active = 0;
+    if (sm == NULL || jid_signal_address(&g_retry.device, addr, sizeof addr) < 0)
+        return;
+    zbuf b;
+    zbuf_init(&b, pt, sizeof pt);
+    pb_put_string(&b, 1, sm->text);
+    if (sm->is_group) {
+        uint8_t dist[256];
+        char gid[WA_JID_STR_MAX], own_addr[96];
+        wa_jid self;
+        own_identity(c, strcmp(g_retry.device.server, WA_SERVER_LID) == 0, &self);
+        jid_signal_address(&self, own_addr, sizeof own_addr);
+        jid_format(&sm->chat, gid, sizeof gid);
+        long dl = senderkey_distribution(gid, own_addr, dist, sizeof dist);
+        if (dl > 0) {
+            size_t m = pb_begin(&b, 2);
+            pb_put_string(&b, 1, gid);
+            pb_put_bytes(&b, 2, dist, (size_t)dl);
+            pb_end(&b, m);
+        }
+    }
+    size_t plen = b.len;
+    if (!sm->is_group && own_user(c, &g_retry.device)) {
+        static uint8_t dsm[ZAPC_MSG_TEXT_MAX + 600];
+        plen = build_dsm_proto(&sm->chat, pt, b.len, dsm, sizeof dsm);
+        memcpy(pt, dsm, plen);
+    }
+    if (b.overflow || plen == 0)
+        return;
+    memcpy(pad, pt, plen);
+    size_t padded = wa_pad_message(pad, plen, sizeof pad);
+    int pkmsg = 0;
+    long ctl = signal_encrypt(&c->dev, addr, pad, padded, ct, sizeof ct, &pkmsg);
+    zap_secure_zero(pad, sizeof pad);
+    if (ctl < 0) {
+        LOGW("msg", "cannot re-encrypt %s for %s", sm->id, addr);
+        return;
+    }
+    char count[12];
+    snprintf(count, sizeof count, "%u", g_retry.count);
+    wa_attr ea[] = {WA_ATTR("v", "2"), WA_ATTR("type", pkmsg ? "pkmsg" : "msg"),
+                    WA_ATTR("count", count)};
+    wa_node content[2] = {
+        {"enc", ea, 3, NULL, 0, ct, (size_t)ctl, WA_CONTENT_BYTES},
+        {"device-identity", NULL, 0, NULL, 0, c->dev.account, c->dev.account_len,
+         WA_CONTENT_BYTES},
+    };
+    wa_attr a[] = {WA_ATTR_JID("to", g_retry.to), WA_ATTR("type", "text"),
+                   WA_ATTR("id", sm->id), WA_ATTR("t", g_retry.t),
+                   WA_ATTR("device_fanout", sm->is_group ? "" : "false"),
+                   WA_ATTR_JID("participant", g_retry.participant)};
+    wa_node m = {"message", a, WA_COUNT(a), content, pkmsg ? 2u : 1u, NULL, 0,
+                 WA_CONTENT_CHILDREN};
+    if (wa_send_node(c, &m) == 0)
+        LOGI("msg", "resent %s to %s (retry %u)", sm->id, addr, g_retry.count);
+}
+
+static void handle_retry_receipt(wa_client *c, const wa_node *node)
+{
+    const wa_node *retry = wa_node_child(node, "retry");
+    const char *from = wa_node_attr(node, "from");
+    const char *participant = wa_node_attr(node, "participant");
+    const char *mid = wa_node_attr(retry, "id");
+    const char *cnt = wa_node_attr(retry, "count");
+    const char *t = wa_node_attr(retry, "t");
+    if (g_retry.active && plat_now_ms() - g_retry.started > 60000)
+        g_retry.active = 0; /* the prekey request was lost */
+    if (retry == NULL || from == NULL || mid == NULL || g_retry.active)
+        return;
+    sent_msg *sm = find_sent(mid);
+    if (sm == NULL) {
+        LOGD("msg", "retry for unknown message %s", mid);
+        return;
+    }
+    if (++sm->retries > MAX_RETRIES_PER_MSG)
+        return;
+    memset(&g_retry, 0, sizeof g_retry);
+    zstrlcpy(g_retry.msg_id, mid, sizeof g_retry.msg_id);
+    zstrlcpy(g_retry.to, from, sizeof g_retry.to);
+    zstrlcpy(g_retry.participant, participant ? participant : "",
+             sizeof g_retry.participant);
+    zstrlcpy(g_retry.t, t ? t : "", sizeof g_retry.t);
+    g_retry.count = cnt != NULL ? (unsigned)strtoul(cnt, NULL, 10) : 1;
+    if (jid_parse(&g_retry.device, participant ? participant : from) != 0)
+        return;
+    g_retry.device.agent = 0;
+    char addr[96];
+    if (jid_signal_address(&g_retry.device, addr, sizeof addr) < 0)
+        return;
+    g_retry.active = 1;
+    g_retry.started = plat_now_ms();
+
+    sig_bundle b;
+    if (wa_node_child(node, "keys") != NULL && bundle_from_node(node, &b) == 0) {
+        if (signal_session_from_bundle(&c->dev, addr, &b) != 0) {
+            g_retry.active = 0;
+            return;
+        }
+    } else if (!signal_has_session(addr) || g_retry.count >= 2) {
+        /* fetch a fresh bundle first */
+        char dj[WA_JID_STR_MAX];
+        jid_format(&g_retry.device, dj, sizeof dj);
+        wa_attr ua[] = {WA_ATTR_JID("jid", dj), WA_ATTR("reason", "identity")};
+        wa_node user = {"user", ua, 2, NULL, 0, NULL, 0, WA_CONTENT_NONE};
+        wa_node key = {"key", NULL, 0, &user, 1, NULL, 0, WA_CONTENT_CHILDREN};
+        wa_attr a[] = {WA_ATTR("id", ""), WA_ATTR("xmlns", "encrypt"),
+                       WA_ATTR("type", "get"), WA_ATTR_JID("to", WA_SERVER_USER)};
+        wa_node iq = {"iq", a, WA_COUNT(a), &key, 1, NULL, 0, WA_CONTENT_CHILDREN};
+        if (wa_send_iq(c, &iq, IQ_PREKEY_RETRY, -1, NULL, 0) != 0)
+            g_retry.active = 0;
+        return;
+    }
+    resend_for_retry(c);
+}
+
+static void handle_retry_prekeys(wa_client *c, const wa_node *iq)
+{
+    const wa_node *list = wa_node_child(iq, "list");
+    if (!g_retry.active || list == NULL || list->content != WA_CONTENT_CHILDREN ||
+        list->child_count == 0) {
+        g_retry.active = 0;
+        return;
+    }
+    sig_bundle b;
+    char addr[96];
+    if (bundle_from_node(&list->children[0], &b) != 0 ||
+        jid_signal_address(&g_retry.device, addr, sizeof addr) < 0 ||
+        signal_session_from_bundle(&c->dev, addr, &b) != 0) {
+        g_retry.active = 0;
+        return;
+    }
+    resend_for_retry(c);
+}
+
 void wa_handle_receipt(wa_client *c, const wa_node *node)
 {
     const char *type = wa_node_attr(node, "type");
@@ -418,7 +640,7 @@ void wa_handle_receipt(wa_client *c, const wa_node *node)
     if (from == NULL || id == NULL || c->ev.on_receipt == NULL)
         return;
     if (type != NULL && strcmp(type, "retry") == 0) {
-        LOGI("msg", "recipient asked for a retry of %s (not supported yet)", id);
+        handle_retry_receipt(c, node);
         return;
     }
     wa_jid chat;
@@ -1060,6 +1282,7 @@ static void finish_send(wa_client *c, wa_send_job *job)
         return;
     }
     LOGI("msg", "message %s sent (%zu device envelopes)", job->id, n);
+    remember_sent(job->id, &job->to, job->is_group, job->text);
     c->send_job = NULL;
 }
 
@@ -1075,6 +1298,8 @@ void wa_handle_iq_result(wa_client *c, const wa_node *node,
              wa_node_attr(err, "text") ? wa_node_attr(err, "text") : "");
         if (req->slot >= 0)
             wa_message_job_abort(c, "server error");
+        if (req->kind == IQ_PREKEY_RETRY)
+            g_retry.active = 0;
         return;
     }
     switch (req->kind) {
@@ -1114,6 +1339,9 @@ void wa_handle_iq_result(wa_client *c, const wa_node *node,
         break;
     case IQ_PREKEY_FETCH:
         handle_prekey_result(c, node);
+        break;
+    case IQ_PREKEY_RETRY:
+        handle_retry_prekeys(c, node);
         break;
     default:
         break;

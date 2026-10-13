@@ -74,6 +74,7 @@ typedef enum {
     IQ_PREKEY_FETCH,
     IQ_GROUP_INFO,
     IQ_MEDIA_CONN,
+    IQ_PREKEY_RETRY,
     IQ_KEEPALIVE
 } wa_iq_kind;
 
