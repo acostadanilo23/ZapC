@@ -160,7 +160,7 @@ ajuste no primeiro uso. Se a conexão falhar, rode com `--log-level debug` (ou
 ZapC busca automaticamente a versão atual em `web.whatsapp.com/sw.js`.
 
 Ainda não implementado: download/upload de mídia (`/download`, `/upload`),
-retry de mensagens que o destinatário não conseguiu decifrar, app state sync
+app state sync
 (nomes de contatos da agenda, arquivar, silenciar), pairing code, chamadas.
 
 ### Memória

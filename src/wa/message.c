@@ -388,19 +388,28 @@ void wa_handle_message(wa_client *c, const wa_node *node)
     }
     zap_secure_zero(plain, sizeof plain);
 
-    if (hist_queued) {
-        /* <receipt id=.. type="hist_sync" to=own-jid/> */
+    const char *category = wa_node_attr(node, "category");
+    const char *mtype = wa_node_attr(node, "type");
+    int peer = category != NULL && strcmp(category, "peer") == 0;
+    if (hist_queued || (peer && decrypted_any)) {
+        /* protocol receipts go to our own JID:
+         * <receipt id=.. type="hist_sync"|"peer_msg" to=own-jid/> */
         char own[WA_JID_STR_MAX];
         wa_jid me;
         jid_to_non_ad(&me, &c->dev.jid);
         jid_format(&me, own, sizeof own);
-        wa_attr ha[] = {WA_ATTR("id", id), WA_ATTR("type", "hist_sync"),
+        wa_attr ha[] = {WA_ATTR("id", id),
+                        WA_ATTR("type", hist_queued ? "hist_sync" : "peer_msg"),
                         WA_ATTR_JID("to", own)};
         wa_node hr = {"receipt", ha, 3, NULL, 0, NULL, 0, WA_CONTENT_NONE};
         (void)wa_send_node(c, &hr);
     }
     if (decrypted_any) {
-        send_receipt(c, node, m.from_me ? "sender" : "inactive");
+        const char *rtype = "inactive";
+        if (m.from_me)
+            rtype = mtype != NULL && strcmp(mtype, "peer_msg") == 0 ? "peer_msg"
+                                                                      : "sender";
+        send_receipt(c, node, rtype);
         if (m.text[0] != '\0' && c->ev.on_message != NULL)
             c->ev.on_message(c->ev.user, &m);
     } else if (failed) {
