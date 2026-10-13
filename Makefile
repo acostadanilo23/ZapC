@@ -63,6 +63,7 @@ CORE_SRC = \
 	src/net/tcp.c \
 	src/net/tls_$(TLS_BACKEND).c \
 	src/net/websocket.c \
+	src/net/http.c \
 	src/wa/jid.c \
 	src/wa/tokens.c \
 	src/wa/binary_node.c \
@@ -73,6 +74,8 @@ CORE_SRC = \
 	src/wa/signal.c \
 	src/wa/pairing.c \
 	src/wa/message.c \
+	src/wa/media.c \
+	src/wa/history_sync.c \
 	src/wa/client.c \
 	src/storage/storage.c \
 	src/storage/credentials.c \

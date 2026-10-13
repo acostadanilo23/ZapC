@@ -16,6 +16,8 @@ void config_defaults(zapc_config *cfg)
     cfg->color = 1;
     snprintf(cfg->wa_host, sizeof cfg->wa_host, "web.whatsapp.com");
     cfg->wa_port = 443;
+    cfg->media_port = 443;
+    cfg->history_sync = 1;
     snprintf(cfg->wa_path, sizeof cfg->wa_path, "/ws/chat");
     cfg->wa_version[0] = 2;
     cfg->wa_version[1] = 3000;
@@ -89,6 +91,18 @@ int config_set(zapc_config *cfg, const char *key, const char *value)
         if (parse_uint(value, 65535, &n) != 0 || n == 0)
             return -1;
         cfg->wa_port = (uint16_t)n;
+        return 0;
+    }
+    if (strcmp(key, "media_host") == 0)
+        return copy_str(cfg->media_host, sizeof cfg->media_host, value);
+    if (strcmp(key, "media_port") == 0) {
+        if (parse_uint(value, 65535, &n) != 0 || n == 0)
+            return -1;
+        cfg->media_port = (uint16_t)n;
+        return 0;
+    }
+    if (strcmp(key, "history_sync") == 0) {
+        cfg->history_sync = parse_bool(value);
         return 0;
     }
     if (strcmp(key, "ca_file") == 0)

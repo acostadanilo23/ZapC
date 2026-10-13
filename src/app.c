@@ -678,6 +678,55 @@ static void ev_chat_name(void *user, const wa_jid *chat, const char *name)
     g_app.dirty = 1;
 }
 
+static void ev_history_chat(void *user, const wa_jid *chat, const char *name,
+                            int64_t last_ts, unsigned unread,
+                            const wa_message *msgs, int nmsgs)
+{
+    (void)user;
+    app_state *a = &g_app;
+    chat_entry *ce = chats_touch(&a->chats, chat);
+    int64_t watermark = ce->last_ts; /* messages up to here are logged */
+    if (name != NULL && name[0] != '\0' && ce->name[0] == '\0')
+        zstrlcpy(ce->name, name, sizeof ce->name);
+    int appended = 0;
+    for (int i = 0; i < nmsgs; i++) {
+        const wa_message *m = &msgs[i];
+        if (m->timestamp <= watermark)
+            continue;
+        history_append(m);
+        appended++;
+        zstrlcpyn(ce->preview, m->text, utf8_fit(m->text, strlen(m->text), 40),
+                  sizeof ce->preview);
+        for (char *p = ce->preview; *p; p++)
+            if (*p == '\n')
+                *p = ' ';
+        if (!m->from_me && m->push_name[0] != '\0' && !jid_is_group(&m->sender))
+            contacts_set(&a->contacts, &m->sender, m->push_name);
+    }
+    if (last_ts > ce->last_ts)
+        ce->last_ts = last_ts;
+    int open = a->chat_open && jid_same_user(&a->chat, chat);
+    if (!open && unread > ce->unread)
+        ce->unread = unread;
+    if (open && appended > 0)
+        load_window(-1);
+    a->chats.dirty = 1;
+    a->dirty = 1;
+}
+
+static void ev_push_name(void *user, const wa_jid *jid, const char *name)
+{
+    (void)user;
+    contacts_set(&g_app.contacts, jid, name);
+}
+
+static void ev_history_done(void *user, unsigned chats, unsigned messages)
+{
+    (void)user;
+    notice("hist\xc3\xb3rico sincronizado: %u conversas, %u mensagens", chats,
+           messages);
+}
+
 /* ======================================================================== */
 /* commands                                                                 */
 /* ======================================================================== */
@@ -1016,8 +1065,10 @@ int app_run(const zapc_config *cfg, const app_options *opt)
     chats_load(&a->chats);
     contacts_load(&a->contacts);
 
-    wa_events ev = {NULL, ev_state, ev_qr, ev_paired, ev_logged_out,
-                    ev_message, ev_receipt, ev_chat_name};
+    wa_events ev = {NULL,          ev_state,        ev_qr,
+                    ev_paired,     ev_logged_out,   ev_message,
+                    ev_receipt,    ev_chat_name,    ev_history_chat,
+                    ev_push_name,  ev_history_done};
     if (wa_client_init(&g_wa, &a->cfg, &ev) != 0) {
         term_shutdown();
         fprintf(stderr, "zapc: failed to initialise client (see %s)\n", logpath);

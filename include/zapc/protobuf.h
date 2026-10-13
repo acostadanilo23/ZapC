@@ -61,4 +61,52 @@ void pb_put_fixed64(zbuf *b, uint32_t num, uint64_t v);
 size_t pb_begin(zbuf *b, uint32_t num);
 void pb_end(zbuf *b, size_t mark);
 
+/* ---- streaming walker ---------------------------------------------------- */
+/*
+ * Parses a protobuf stream fed in arbitrary chunks without holding it in
+ * memory.  For every length-delimited field the callback decides whether to
+ * skip it, descend into it as a sub-message, or buffer it whole (up to the
+ * walker's buffer size; larger fields are skipped).
+ */
+#define PBW_MAX_DEPTH 8
+
+typedef enum { PBW_SKIP = 0, PBW_DESCEND, PBW_BUFFER } pbw_action;
+
+typedef struct pb_walker pb_walker;
+
+struct pb_walker {
+    /* callbacks */
+    pbw_action (*on_len)(pb_walker *w, uint32_t field, uint64_t len);
+    void (*on_varint)(pb_walker *w, uint32_t field, uint64_t value);
+    void (*on_bytes)(pb_walker *w, uint32_t field, const uint8_t *data,
+                     size_t len);
+    void (*on_end)(pb_walker *w, uint32_t field); /* end of descended msg */
+    void *user;
+
+    /* current position */
+    int depth;                          /* 0 = top level            */
+    uint32_t path[PBW_MAX_DEPTH + 1];   /* field numbers of levels  */
+    uint64_t end[PBW_MAX_DEPTH + 1];    /* absolute end offsets     */
+    uint64_t pos;
+
+    /* field parser */
+    int state;
+    uint64_t acc;
+    unsigned shift;
+    uint32_t field;
+    int wire;
+    uint64_t need;
+    int error;
+
+    uint8_t *buf;
+    size_t buf_cap;
+    size_t buf_len;
+};
+
+void pbw_init(pb_walker *w, uint8_t *buf, size_t cap);
+/* Returns 0, or -1 once the stream is malformed. */
+int pbw_feed(pb_walker *w, const uint8_t *data, size_t len);
+/* Returns 0 if the stream ended on a field boundary at the top level. */
+int pbw_finish(pb_walker *w);
+
 #endif

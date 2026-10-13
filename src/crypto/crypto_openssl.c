@@ -214,3 +214,120 @@ long crypto_aes256_cbc_decrypt(const uint8_t key[32], const uint8_t iv[16],
 {
     return cbc_crypt(0, key, iv, in, len, out, out_cap);
 }
+
+/* ---- streaming -------------------------------------------------------------- */
+
+int zc_sha256_init(zc_sha256_ctx *c)
+{
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (ctx == NULL || EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+        EVP_MD_CTX_free(ctx);
+        c->impl = NULL;
+        return -1;
+    }
+    c->impl = ctx;
+    return 0;
+}
+
+int zc_sha256_update(zc_sha256_ctx *c, const void *data, size_t len)
+{
+    if (c->impl == NULL)
+        return -1;
+    return EVP_DigestUpdate(c->impl, data, len) == 1 ? 0 : -1;
+}
+
+int zc_sha256_final(zc_sha256_ctx *c, uint8_t out[32])
+{
+    if (c->impl == NULL)
+        return -1;
+    int ok = EVP_DigestFinal_ex(c->impl, out, NULL) == 1;
+    EVP_MD_CTX_free(c->impl);
+    c->impl = NULL;
+    return ok ? 0 : -1;
+}
+
+int zc_hmac_sha256_init(zc_hmac_ctx *c, const void *key, size_t key_len)
+{
+    uint8_t k[64], ipad[64];
+    memset(k, 0, sizeof k);
+    if (key_len > 64) {
+        if (crypto_sha256(key, key_len, k) != 0)
+            return -1;
+    } else if (key_len > 0) {
+        memcpy(k, key, key_len);
+    }
+    for (int i = 0; i < 64; i++) {
+        ipad[i] = (uint8_t)(k[i] ^ 0x36);
+        c->opad[i] = (uint8_t)(k[i] ^ 0x5c);
+    }
+    int r = zc_sha256_init(&c->inner) == 0 &&
+                    zc_sha256_update(&c->inner, ipad, 64) == 0
+                ? 0
+                : -1;
+    zap_secure_zero(k, sizeof k);
+    zap_secure_zero(ipad, sizeof ipad);
+    return r;
+}
+
+int zc_hmac_sha256_update(zc_hmac_ctx *c, const void *data, size_t len)
+{
+    return zc_sha256_update(&c->inner, data, len);
+}
+
+int zc_hmac_sha256_final(zc_hmac_ctx *c, uint8_t out[32])
+{
+    uint8_t inner[32];
+    zc_sha256_ctx o;
+    if (zc_sha256_final(&c->inner, inner) != 0 || zc_sha256_init(&o) != 0)
+        return -1;
+    int r = zc_sha256_update(&o, c->opad, 64) == 0 &&
+                    zc_sha256_update(&o, inner, 32) == 0 &&
+                    zc_sha256_final(&o, out) == 0
+                ? 0
+                : -1;
+    zap_secure_zero(c->opad, sizeof c->opad);
+    return r;
+}
+
+int zc_cbc_decrypt_init(zc_cbc_ctx *c, const uint8_t key[32],
+                        const uint8_t iv[16])
+{
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (ctx == NULL ||
+        EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        c->impl = NULL;
+        return -1;
+    }
+    c->impl = ctx;
+    return 0;
+}
+
+long zc_cbc_decrypt_update(zc_cbc_ctx *c, const uint8_t *in, size_t len,
+                           uint8_t *out)
+{
+    int outl = 0;
+    if (c->impl == NULL || len > INT32_MAX - 32)
+        return -1;
+    if (EVP_DecryptUpdate(c->impl, out, &outl, in, (int)len) != 1)
+        return -1;
+    return outl;
+}
+
+long zc_cbc_decrypt_final(zc_cbc_ctx *c, uint8_t out[16])
+{
+    int outl = 0;
+    if (c->impl == NULL)
+        return -1;
+    int ok = EVP_DecryptFinal_ex(c->impl, out, &outl) == 1;
+    EVP_CIPHER_CTX_free(c->impl);
+    c->impl = NULL;
+    return ok ? outl : -1;
+}
+
+void zc_cbc_free(zc_cbc_ctx *c)
+{
+    if (c->impl != NULL)
+        EVP_CIPHER_CTX_free(c->impl);
+    c->impl = NULL;
+}

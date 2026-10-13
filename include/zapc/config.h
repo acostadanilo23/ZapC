@@ -25,6 +25,9 @@ typedef struct {
     uint16_t wa_port;
     char wa_path[128];
     char ca_file[ZAPC_PATH_MAX];      /* optional extra CA bundle         */
+    char media_host[128];             /* override media server (testing)  */
+    uint16_t media_port;
+    int history_sync;                 /* process history sync blobs       */
     uint32_t wa_version[3];           /* WhatsApp Web version to announce */
     char device_name[32];             /* shown in "Linked devices"        */
     char push_name[ZAPC_NAME_MAX];

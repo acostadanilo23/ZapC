@@ -53,6 +53,12 @@ typedef struct {
     void (*on_receipt)(void *user, const wa_jid *chat, const char *msg_id,
                        const char *type);
     void (*on_chat_name)(void *user, const wa_jid *chat, const char *name);
+    /* history sync: one call per conversation (msgs oldest first) */
+    void (*on_history_chat)(void *user, const wa_jid *chat, const char *name,
+                            int64_t last_ts, unsigned unread,
+                            const wa_message *msgs, int nmsgs);
+    void (*on_push_name)(void *user, const wa_jid *jid, const char *name);
+    void (*on_history_done)(void *user, unsigned chats, unsigned messages);
 } wa_events;
 
 #define WA_MAX_PENDING_IQ 16
@@ -67,8 +73,22 @@ typedef enum {
     IQ_USYNC_DEVICES,
     IQ_PREKEY_FETCH,
     IQ_GROUP_INFO,
+    IQ_MEDIA_CONN,
     IQ_KEEPALIVE
 } wa_iq_kind;
+
+#define WA_MAX_HIST_JOBS 4
+#define WA_MEDIA_HOSTS 4
+
+/* A pending history sync download (from a HistorySyncNotification). */
+typedef struct {
+    char direct_path[512];
+    uint8_t media_key[32];
+    uint8_t enc_sha256[32];
+    int has_enc_sha256;
+    char inline_path[ZAPC_PATH_MAX]; /* inline zlib payload saved to disk */
+    unsigned sync_type;
+} wa_hist_job;
 
 typedef struct {
     char id[24];
@@ -126,6 +146,13 @@ typedef struct wa_client {
 
     struct wa_send_job *send_job; /* in-flight outgoing message (or NULL) */
 
+    /* history sync */
+    wa_hist_job hist_jobs[WA_MAX_HIST_JOBS];
+    int hist_count;
+    unsigned hist_seq;
+    char media_hosts[WA_MEDIA_HOSTS][64];
+    int n_media_hosts;
+
     /* fixed buffers (must stay last: wa_client_init clears up to here) */
     zap_arena arena;
     uint8_t arena_mem[ZAPC_NODE_ARENA_SIZE];
@@ -182,5 +209,6 @@ void wa_send_ack(wa_client *c, const wa_node *node, const char *error_code);
 void wa_upload_prekeys(wa_client *c, unsigned count);
 void wa_message_job_abort(wa_client *c, const char *why);
 void wa_message_job_timeout(wa_client *c);
+void wa_history_run_pending(wa_client *c);
 
 #endif

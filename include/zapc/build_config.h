@@ -83,6 +83,17 @@
 #define ZAPC_LOG_RING 32                /* lines kept for /debug            */
 #endif
 
+/* ---- history sync -------------------------------------------------------- */
+#ifndef ZAPC_HISTORY_PER_CHAT
+#define ZAPC_HISTORY_PER_CHAT 32        /* newest messages kept per chat    */
+#endif
+#ifndef ZAPC_HISTORY_MSG_MAX
+#define ZAPC_HISTORY_MSG_MAX (64u * 1024u) /* larger history entries skipped */
+#endif
+#ifndef ZAPC_HISTORY_BLOB_MAX
+#define ZAPC_HISTORY_BLOB_MAX (512ull * 1024u * 1024u) /* sanity limit      */
+#endif
+
 /* ---- Signal ------------------------------------------------------------ */
 #ifndef ZAPC_MAX_SESSIONS
 #define ZAPC_MAX_SESSIONS 32            /* Signal sessions cached in RAM    */

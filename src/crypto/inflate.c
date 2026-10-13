@@ -1,9 +1,13 @@
 /*
  * ZapC - small zlib/DEFLATE decoder (RFC 1950/1951).
  *
- * Output goes into a fixed caller buffer; input larger than the buffer is
- * rejected.  Uses canonical Huffman decoding by code length (the method used
- * by Mark Adler's "puff"), which needs very little memory.
+ * Streaming: input is pulled through a read callback into a 4 KiB buffer and
+ * output is kept in a 32 KiB circular window (the maximum DEFLATE distance)
+ * that is flushed to a write callback.  A multi-megabyte history blob can
+ * therefore be decompressed with ~37 KiB of memory.
+ *
+ * Huffman decoding uses canonical codes by length (the method used by Mark
+ * Adler's "puff"), which needs very little memory.
  */
 #include "zapc/inflate.h"
 
@@ -13,16 +17,24 @@
 #define MAXLCODES 286
 #define MAXDCODES 30
 #define FIXLCODES 288
+#define WSIZE 32768u
+#define INBUF 4096u
 
 typedef struct {
-    const uint8_t *in;
-    size_t inlen;
-    size_t inpos;
+    inf_read_fn rd;
+    void *ru;
+    inf_write_fn wr;
+    void *wu;
+    uint8_t in[INBUF];
+    size_t in_len;
+    size_t in_pos;
+    int in_eof;
     uint32_t bitbuf;
     unsigned bitcnt;
-    uint8_t *out;
-    size_t outcap;
-    size_t outpos;
+    uint8_t window[WSIZE];
+    uint64_t out_total;   /* bytes produced so far */
+    uint64_t flushed;     /* bytes handed to wr     */
+    uint64_t out_limit;   /* 0 = unlimited          */
     int err;
 } inf_state;
 
@@ -31,15 +43,33 @@ typedef struct {
     uint16_t symbol[FIXLCODES];
 } huffman;
 
+static int next_byte(inf_state *s, unsigned *b)
+{
+    if (s->in_pos == s->in_len) {
+        if (s->in_eof)
+            return -1;
+        long n = s->rd(s->ru, s->in, sizeof s->in);
+        if (n <= 0) {
+            s->in_eof = 1;
+            return -1;
+        }
+        s->in_len = (size_t)n;
+        s->in_pos = 0;
+    }
+    *b = s->in[s->in_pos++];
+    return 0;
+}
+
 static unsigned getbits(inf_state *s, unsigned need)
 {
     uint32_t val = s->bitbuf;
     while (s->bitcnt < need) {
-        if (s->inpos >= s->inlen) {
+        unsigned b;
+        if (next_byte(s, &b) != 0) {
             s->err = 1;
             return 0;
         }
-        val |= (uint32_t)s->in[s->inpos++] << s->bitcnt;
+        val |= (uint32_t)b << s->bitcnt;
         s->bitcnt += 8;
     }
     s->bitbuf = need < 32 ? val >> need : 0;
@@ -47,22 +77,48 @@ static unsigned getbits(inf_state *s, unsigned need)
     return (unsigned)(val & ((1u << need) - 1u));
 }
 
+static int flush_window(inf_state *s)
+{
+    while (s->flushed < s->out_total) {
+        size_t start = (size_t)(s->flushed % WSIZE);
+        size_t n = (size_t)(s->out_total - s->flushed);
+        if (n > WSIZE - start)
+            n = WSIZE - start;
+        if (s->wr(s->wu, s->window + start, n) != 0)
+            return -1;
+        s->flushed += n;
+    }
+    return 0;
+}
+
+static int put_byte(inf_state *s, uint8_t b)
+{
+    if (s->out_limit != 0 && s->out_total >= s->out_limit)
+        return -1;
+    if (s->out_total - s->flushed == WSIZE && flush_window(s) != 0)
+        return -1;
+    s->window[s->out_total % WSIZE] = b;
+    s->out_total++;
+    return 0;
+}
+
 static int stored(inf_state *s)
 {
+    unsigned b[4];
     s->bitbuf = 0;
     s->bitcnt = 0;
-    if (s->inpos + 4 > s->inlen)
-        return -1;
-    unsigned len = s->in[s->inpos] | ((unsigned)s->in[s->inpos + 1] << 8);
-    unsigned nlen = s->in[s->inpos + 2] | ((unsigned)s->in[s->inpos + 3] << 8);
-    s->inpos += 4;
+    for (int i = 0; i < 4; i++)
+        if (next_byte(s, &b[i]) != 0)
+            return -1;
+    unsigned len = b[0] | (b[1] << 8);
+    unsigned nlen = b[2] | (b[3] << 8);
     if (len != (~nlen & 0xffffu))
         return -1;
-    if (len > s->inlen - s->inpos || len > s->outcap - s->outpos)
-        return -1;
-    memcpy(s->out + s->outpos, s->in + s->inpos, len);
-    s->inpos += len;
-    s->outpos += len;
+    while (len--) {
+        unsigned c;
+        if (next_byte(s, &c) != 0 || put_byte(s, (uint8_t)c) != 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -130,9 +186,8 @@ static int codes(inf_state *s, const huffman *lencode, const huffman *distcode)
         if (sym < 0)
             return -1;
         if (sym < 256) {
-            if (s->outpos >= s->outcap)
+            if (put_byte(s, (uint8_t)sym) != 0)
                 return -1;
-            s->out[s->outpos++] = (uint8_t)sym;
         } else if (sym == 256) {
             return 0;
         } else {
@@ -144,10 +199,13 @@ static int codes(inf_state *s, const huffman *lencode, const huffman *distcode)
             if (dsym < 0 || dsym >= 30)
                 return -1;
             size_t dist = dbase[dsym] + getbits(s, dext[dsym]);
-            if (s->err || dist > s->outpos || len > s->outcap - s->outpos)
+            if (s->err || dist > s->out_total || dist > WSIZE)
                 return -1;
-            for (size_t i = 0; i < len; i++, s->outpos++)
-                s->out[s->outpos] = s->out[s->outpos - dist];
+            while (len--) {
+                uint8_t b = s->window[(s->out_total - dist) % WSIZE];
+                if (put_byte(s, b) != 0)
+                    return -1;
+            }
         }
     }
 }
@@ -233,73 +291,143 @@ static int dynamic(inf_state *s)
     return codes(s, &lencode, &distcode);
 }
 
-long zc_inflate_raw(const uint8_t *in, size_t inlen, size_t *consumed,
-                    uint8_t *out, size_t outcap)
+/* One decoder state (window + input buffer) shared by all callers. */
+static inf_state g_state;
+
+static int run_blocks(inf_state *s)
 {
-    inf_state s;
-    memset(&s, 0, sizeof s);
-    s.in = in;
-    s.inlen = inlen;
-    s.out = out;
-    s.outcap = outcap;
     int last;
     do {
-        last = (int)getbits(&s, 1);
-        unsigned type = getbits(&s, 2);
-        if (s.err)
+        last = (int)getbits(s, 1);
+        unsigned type = getbits(s, 2);
+        if (s->err)
             return -1;
         int r;
         if (type == 0)
-            r = stored(&s);
+            r = stored(s);
         else if (type == 1)
-            r = fixed(&s);
+            r = fixed(s);
         else if (type == 2)
-            r = dynamic(&s);
+            r = dynamic(s);
         else
             r = -1;
-        if (r != 0 || s.err)
+        if (r != 0 || s->err)
             return -1;
     } while (!last);
-    if (consumed != NULL)
-        *consumed = s.inpos;
-    return (long)s.outpos;
+    return flush_window(s);
 }
 
-static uint32_t adler32(const uint8_t *p, size_t n)
+typedef struct {
+    inf_write_fn wr;
+    void *wu;
+    uint32_t a, b;
+} adler_sink;
+
+static int adler_write(void *user, const uint8_t *data, size_t len)
 {
-    uint32_t a = 1, b = 0;
+    adler_sink *as = user;
+    const uint8_t *p = data;
+    size_t n = len;
     while (n > 0) {
         size_t chunk = n < 3800 ? n : 3800;
         n -= chunk;
         while (chunk--) {
-            a += *p++;
-            b += a;
+            as->a += *p++;
+            as->b += as->a;
         }
-        a %= 65521u;
-        b %= 65521u;
+        as->a %= 65521u;
+        as->b %= 65521u;
     }
-    return (b << 16) | a;
+    return as->wr(as->wu, data, len);
+}
+
+long zc_inflate_stream(int zlib, inf_read_fn rd, void *ru, inf_write_fn wr,
+                       void *wu, uint64_t limit)
+{
+    inf_state *s = &g_state;
+    adler_sink as = {wr, wu, 1, 0};
+    memset(s, 0, offsetof(inf_state, window));
+    s->rd = rd;
+    s->ru = ru;
+    s->wr = zlib ? adler_write : wr;
+    s->wu = zlib ? (void *)&as : wu;
+    s->out_limit = limit;
+    if (zlib) {
+        unsigned cmf, flg;
+        if (next_byte(s, &cmf) != 0 || next_byte(s, &flg) != 0 ||
+            (cmf & 15) != 8 || (cmf >> 4) > 7 || ((cmf << 8) | flg) % 31 != 0 ||
+            (flg & 0x20))
+            return -1;
+    }
+    if (run_blocks(s) != 0)
+        return -1;
+    if (zlib) {
+        /* the adler32 trailer starts at the next byte boundary */
+        s->bitbuf = 0;
+        s->bitcnt = 0;
+        unsigned b[4];
+        for (int i = 0; i < 4; i++)
+            if (next_byte(s, &b[i]) != 0)
+                return -1;
+        uint32_t want = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+                        ((uint32_t)b[2] << 8) | b[3];
+        if (((as.b << 16) | as.a) != want)
+            return -1;
+    }
+    return s->out_total > (uint64_t)INT32_MAX ? INT32_MAX : (long)s->out_total;
+}
+
+/* ---- buffer API on top of the stream API -------------------------------- */
+
+typedef struct {
+    const uint8_t *p;
+    size_t left;
+    size_t consumed;
+} mem_reader;
+
+static long mem_read(void *user, uint8_t *buf, size_t cap)
+{
+    mem_reader *m = user;
+    size_t n = m->left < cap ? m->left : cap;
+    memcpy(buf, m->p, n);
+    m->p += n;
+    m->left -= n;
+    m->consumed += n;
+    return (long)n;
+}
+
+typedef struct {
+    uint8_t *out;
+    size_t cap;
+    size_t len;
+} mem_writer;
+
+static int mem_write(void *user, const uint8_t *data, size_t len)
+{
+    mem_writer *w = user;
+    if (len > w->cap - w->len)
+        return -1;
+    memcpy(w->out + w->len, data, len);
+    w->len += len;
+    return 0;
 }
 
 long zc_inflate_zlib(const uint8_t *in, size_t inlen, uint8_t *out,
                      size_t outcap)
 {
-    if (inlen < 6)
-        return -1;
-    unsigned cmf = in[0], flg = in[1];
-    if ((cmf & 15) != 8 || (cmf >> 4) > 7 || ((cmf << 8) | flg) % 31 != 0 ||
-        (flg & 0x20))
-        return -1;
-    size_t used = 0;
-    long n = zc_inflate_raw(in + 2, inlen - 2, &used, out, outcap);
-    if (n < 0)
-        return -1;
-    size_t pos = 2 + used;
-    if (pos + 4 > inlen)
-        return -1;
-    uint32_t want = ((uint32_t)in[pos] << 24) | ((uint32_t)in[pos + 1] << 16) |
-                    ((uint32_t)in[pos + 2] << 8) | in[pos + 3];
-    if (adler32(out, (size_t)n) != want)
-        return -1;
-    return n;
+    mem_reader r = {in, inlen, 0};
+    mem_writer w = {out, outcap, 0};
+    long n = zc_inflate_stream(1, mem_read, &r, mem_write, &w, outcap);
+    return n < 0 ? -1 : (long)w.len;
+}
+
+long zc_inflate_raw(const uint8_t *in, size_t inlen, size_t *consumed,
+                    uint8_t *out, size_t outcap)
+{
+    mem_reader r = {in, inlen, 0};
+    mem_writer w = {out, outcap, 0};
+    long n = zc_inflate_stream(0, mem_read, &r, mem_write, &w, outcap);
+    if (consumed != NULL) /* bytes consumed, minus what is still buffered */
+        *consumed = r.consumed - (g_state.in_len - g_state.in_pos);
+    return n < 0 ? -1 : (long)w.len;
 }

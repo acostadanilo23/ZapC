@@ -23,6 +23,7 @@
 #include "zapc/binary_node.h"
 #include "zapc/crypto.h"
 #include "zapc/log.h"
+#include "zapc/media.h"
 #include "zapc/noise.h"
 #include "zapc/platform.h"
 #include "zapc/protobuf.h"
@@ -57,6 +58,9 @@
 #define GROUP_TEXT "mensagem no grupo"
 #define GROUP_IN_TEXT "oi grupo, aqui \xc3\xa9 a Maria"
 #define MARIA_ADDR "5511888887777:0"
+#define GROUP2_JID "120363999@g.us"
+#define HIST_PATH "/v/t62.15575-24/hist.enc?ccb=11-4"
+#define HIST_MSGS 40
 
 static char g_dir[256];
 static EVP_PKEY *g_tls_key;
@@ -441,6 +445,146 @@ static size_t padded_message(const char *text, uint8_t *out, size_t cap)
     zbuf_init(&b, out, cap);
     pb_put_string(&b, 1, text);
     return wa_pad_message(out, b.len, cap);
+}
+
+/* zlib stream made of stored blocks (no compressor needed in the test). */
+static size_t zlib_stored(const uint8_t *in, size_t len, uint8_t *out, size_t cap)
+{
+    size_t o = 0, pos = 0;
+    uint32_t a = 1, b = 0;
+    out[o++] = 0x78;
+    out[o++] = 0x01;
+    do {
+        size_t n = len - pos > 65535 ? 65535 : len - pos;
+        if (o + 5 + n + 4 > cap)
+            return 0;
+        out[o++] = (uint8_t)(pos + n == len ? 1 : 0);
+        out[o++] = (uint8_t)n;
+        out[o++] = (uint8_t)(n >> 8);
+        out[o++] = (uint8_t)~n;
+        out[o++] = (uint8_t)(~n >> 8);
+        memcpy(out + o, in + pos, n);
+        o += n;
+        pos += n;
+    } while (pos < len);
+    for (size_t i = 0; i < len; i++) {
+        a = (a + in[i]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    uint32_t ad = (b << 16) | a;
+    out[o++] = (uint8_t)(ad >> 24);
+    out[o++] = (uint8_t)(ad >> 16);
+    out[o++] = (uint8_t)(ad >> 8);
+    out[o++] = (uint8_t)ad;
+    return o;
+}
+
+static size_t build_history(uint8_t *out, size_t cap)
+{
+    static uint8_t conv[200000], hmsg[2048], wmi[2048], tmp[1024];
+    zbuf b, c, h, w, t;
+    zbuf_init(&b, out, cap);
+    pb_put_uint(&b, 1, 0); /* INITIAL_BOOTSTRAP */
+    /* conversation with Maria: newest first, more than the ring holds */
+    zbuf_init(&c, conv, sizeof conv);
+    pb_put_string(&c, 1, MARIA_JID);
+    for (int i = HIST_MSGS - 1; i >= 0; i--) {
+        char text[32], id[16];
+        snprintf(text, sizeof text, "historico %d", i);
+        snprintf(id, sizeof id, "H%d", i);
+        zbuf_init(&w, wmi, sizeof wmi);
+        size_t k = pb_begin(&w, 1);
+        pb_put_string(&w, 1, MARIA_JID);
+        pb_put_bool(&w, 2, i % 3 == 0);
+        pb_put_string(&w, 3, id);
+        pb_end(&w, k);
+        zbuf_init(&t, tmp, sizeof tmp);
+        pb_put_string(&t, 1, text);
+        pb_put_bytes(&w, 2, tmp, t.len);
+        pb_put_uint(&w, 3, (uint64_t)(1000 + i));
+        zbuf_init(&h, hmsg, sizeof hmsg);
+        pb_put_bytes(&h, 1, wmi, w.len);
+        pb_put_uint(&h, 2, (uint64_t)i);
+        pb_put_bytes(&c, 2, hmsg, h.len);
+    }
+    pb_put_uint(&c, 6, 2);
+    pb_put_uint(&c, 12, 1039);
+    pb_put_string(&c, 13, "Maria Silva");
+    pb_put_bytes(&b, 2, conv, c.len);
+    /* a group with one message from another participant */
+    zbuf_init(&c, conv, sizeof conv);
+    pb_put_string(&c, 1, GROUP2_JID);
+    zbuf_init(&w, wmi, sizeof wmi);
+    size_t k = pb_begin(&w, 1);
+    pb_put_string(&w, 1, GROUP2_JID);
+    pb_put_bool(&w, 2, 0);
+    pb_put_string(&w, 3, "G1");
+    pb_put_string(&w, 4, "5511777776666@s.whatsapp.net");
+    pb_end(&w, k);
+    zbuf_init(&t, tmp, sizeof tmp);
+    k = pb_begin(&t, 6);
+    pb_put_string(&t, 1, "reuniao amanha");
+    pb_end(&t, k);
+    pb_put_bytes(&w, 2, tmp, t.len);
+    pb_put_uint(&w, 3, 2000);
+    pb_put_string(&w, 19, "Joao");
+    zbuf_init(&h, hmsg, sizeof hmsg);
+    pb_put_bytes(&h, 1, wmi, w.len);
+    pb_put_bytes(&c, 2, hmsg, h.len);
+    pb_put_string(&c, 13, "Trabalho");
+    pb_put_bytes(&b, 2, conv, c.len);
+    /* push names */
+    zbuf_init(&t, tmp, sizeof tmp);
+    pb_put_string(&t, 1, "5511777776666@s.whatsapp.net");
+    pb_put_string(&t, 2, "Joao");
+    pb_put_bytes(&b, 7, tmp, t.len);
+    return b.overflow ? 0 : b.len;
+}
+
+/* Serve one HTTPS request for the history blob (chunked encoding). */
+static void serve_media(int lfd, const uint8_t *data, size_t len,
+                        const char *expect_hash)
+{
+    int fd = accept(lfd, NULL, NULL);
+    if (fd < 0)
+        die("media accept");
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_use_certificate(ctx, g_tls_cert);
+    SSL_CTX_use_PrivateKey(ctx, g_tls_key);
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, fd);
+    if (SSL_accept(ssl) != 1)
+        die("media TLS accept");
+    char req[4096];
+    size_t have = 0;
+    while (have < sizeof req - 1) {
+        if (SSL_read(ssl, req + have, 1) != 1)
+            die("media request read");
+        have++;
+        req[have] = '\0';
+        if (have >= 4 && memcmp(req + have - 4, "\r\n\r\n", 4) == 0)
+            break;
+    }
+    if (strncmp(req, "GET " HIST_PATH "&hash=", strlen("GET " HIST_PATH "&hash=")) != 0 ||
+        strstr(req, expect_hash) == NULL || strstr(req, "mms-type=md-msg-hist") == NULL)
+        die("unexpected media request: %.200s", req);
+    const char *hdr = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    ssl_write_full(ssl, hdr, strlen(hdr));
+    size_t pos = 0;
+    while (pos < len) {
+        size_t n = len - pos > 1000 ? 1000 : len - pos;
+        char cl[32];
+        int l = snprintf(cl, sizeof cl, "%zx\r\n", n);
+        ssl_write_full(ssl, cl, (size_t)l);
+        ssl_write_full(ssl, data + pos, n);
+        ssl_write_full(ssl, "\r\n", 2);
+        pos += n;
+    }
+    ssl_write_full(ssl, "0\r\n\r\n", 5);
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    close(fd);
 }
 
 static int run_server(int lfd)
@@ -965,6 +1109,68 @@ static int run_server(int lfd)
         fprintf(stderr, "  [server] client decrypted incoming group message\n");
     }
 
+    /* ---------------- history sync from the phone ---------------- */
+    {
+        static uint8_t hist[300000], z[310000], hblob[320000], pad3[2048], env[4096];
+        size_t hl2 = build_history(hist, sizeof hist);
+        size_t zl = zlib_stored(hist, hl2, z, sizeof z);
+        uint8_t media_key[32], enc_sha[32];
+        plat_random(media_key, sizeof media_key);
+        wa_media_keys mk;
+        wa_media_keys_derive(media_key, WA_MEDIA_HISTORY_INFO, &mk);
+        long el = wa_media_encrypt(&mk, z, zl, hblob, sizeof hblob);
+        if (hl2 == 0 || zl == 0 || el < 0)
+            die("cannot build history blob");
+        crypto_sha256(hblob, (size_t)el, enc_sha);
+        uint8_t notif[512], pm[700], msgb[800];
+        zbuf zb;
+        zbuf_init(&zb, notif, sizeof notif);
+        pb_put_uint(&zb, 2, zl);
+        pb_put_bytes(&zb, 3, media_key, 32);
+        pb_put_bytes(&zb, 4, enc_sha, 32);
+        pb_put_string(&zb, 5, HIST_PATH);
+        pb_put_uint(&zb, 6, 0);
+        size_t nl = zb.len;
+        zbuf_init(&zb, pm, sizeof pm);
+        pb_put_uint(&zb, 2, 5); /* HISTORY_SYNC_NOTIFICATION */
+        pb_put_bytes(&zb, 6, notif, nl);
+        size_t pml = zb.len;
+        zbuf_init(&zb, msgb, sizeof msgb);
+        pb_put_bytes(&zb, 12, pm, pml);
+        memcpy(pad3, msgb, zb.len);
+        size_t p3 = wa_pad_message(pad3, zb.len, sizeof pad3);
+        int pk3 = 0;
+        storage_init(addr_dir_phone);
+        long envl = signal_encrypt(&phone, CLIENT_ADDR, pad3, p3, env, sizeof env, &pk3);
+        if (envl < 0)
+            die("phone cannot encrypt for the client");
+        wa_attr e1[] = {WA_ATTR("v", "2"), WA_ATTR("type", pk3 ? "pkmsg" : "msg")};
+        wa_node e = {"enc", e1, 2, NULL, 0, env, (size_t)envl, WA_CONTENT_BYTES};
+        wa_attr ha[] = {WA_ATTR_JID("from", PHONE_USER "@s.whatsapp.net"),
+                        WA_ATTR("id", "HIST1"), WA_ATTR("t", tbuf),
+                        WA_ATTR("type", "text")};
+        wa_node hm = {"message", ha, 4, &e, 1, NULL, 0, WA_CONTENT_CHILDREN};
+        send_node(c, &hm);
+        wa_node *hr = expect_node(c, "receipt", NULL);
+        if (strcmp(wa_node_attr(hr, "id"), "HIST1") != 0 ||
+            wa_node_attr(hr, "type") == NULL ||
+            strcmp(wa_node_attr(hr, "type"), "hist_sync") != 0 ||
+            strcmp(wa_node_attr(hr, "to"), PHONE_USER "@s.whatsapp.net") != 0)
+            die("expected hist_sync receipt");
+        wa_node *sr = expect_node(c, "receipt", NULL);
+        if (strcmp(wa_node_attr(sr, "type"), "sender") != 0)
+            die("expected sender receipt for own message");
+        expect_node(c, "ack", NULL);
+        char b64h[64];
+        base64_encode(enc_sha, 32, b64h, sizeof b64h);
+        for (char *q = b64h; *q; q++) {
+            if (*q == '+') *q = '-';
+            else if (*q == '/') *q = '_';
+        }
+        serve_media(lfd, hblob, (size_t)el, b64h);
+        fprintf(stderr, "  [server] history blob served (%ld bytes)\n", el);
+    }
+
     /* stay until the client hangs up */
     uint8_t tmp[16];
     while (SSL_read(c->ssl, tmp, sizeof tmp) > 0) {
@@ -994,6 +1200,15 @@ typedef struct {
     char group_text[256];
     char group_sender[64];
     char chat_name[64];
+    int hist_done;
+    unsigned hist_chats, hist_messages;
+    int maria_n;
+    char maria_first[64], maria_last[64], maria_name[64];
+    unsigned maria_unread;
+    int64_t maria_ts;
+    int maria_from_me;
+    char group2_name[64], group2_sender[64], group2_push[64];
+    char joao[64];
 } client_obs;
 
 static client_obs g_obs;
@@ -1064,6 +1279,46 @@ static void ev_chat_name(void *u, const wa_jid *chat, const char *name)
         zstrlcpy(g_obs.chat_name, name, sizeof g_obs.chat_name);
 }
 
+static void ev_history_chat(void *u, const wa_jid *chat, const char *name,
+                            int64_t last_ts, unsigned unread,
+                            const wa_message *msgs, int n)
+{
+    (void)u;
+    char js[WA_JID_STR_MAX];
+    jid_format(chat, js, sizeof js);
+    if (strcmp(js, MARIA_JID) == 0) {
+        g_obs.maria_n = n;
+        zstrlcpy(g_obs.maria_name, name, sizeof g_obs.maria_name);
+        g_obs.maria_unread = unread;
+        g_obs.maria_ts = last_ts;
+        if (n > 0) {
+            zstrlcpy(g_obs.maria_first, msgs[0].text, sizeof g_obs.maria_first);
+            zstrlcpy(g_obs.maria_last, msgs[n - 1].text, sizeof g_obs.maria_last);
+        }
+        for (int i = 0; i < n; i++)
+            g_obs.maria_from_me += msgs[i].from_me;
+    } else if (strcmp(js, GROUP2_JID) == 0 && n == 1) {
+        zstrlcpy(g_obs.group2_name, name, sizeof g_obs.group2_name);
+        jid_format(&msgs[0].sender, g_obs.group2_sender, sizeof g_obs.group2_sender);
+        zstrlcpy(g_obs.group2_push, msgs[0].push_name, sizeof g_obs.group2_push);
+    }
+}
+
+static void ev_push_name(void *u, const wa_jid *jid, const char *name)
+{
+    (void)u;
+    if (strcmp(jid->user, "5511777776666") == 0)
+        zstrlcpy(g_obs.joao, name, sizeof g_obs.joao);
+}
+
+static void ev_history_done(void *u, unsigned chats, unsigned messages)
+{
+    (void)u;
+    g_obs.hist_done = 1;
+    g_obs.hist_chats = chats;
+    g_obs.hist_messages = messages;
+}
+
 static wa_client g_client;
 
 static void test_end_to_end(void)
@@ -1105,17 +1360,21 @@ static void test_end_to_end(void)
     cfg.wa_port = (uint16_t)port;
     snprintf(cfg.ca_file, sizeof cfg.ca_file, "%s", cert_path);
     snprintf(cfg.state_dir, sizeof cfg.state_dir, "%s", client_dir);
+    snprintf(cfg.media_host, sizeof cfg.media_host, "localhost");
+    cfg.media_port = (uint16_t)port;
     CHECK(storage_init(client_dir) == 0);
     wa_set_noise_root_key(g_root.pub);
 
     wa_events ev = {NULL, ev_state, ev_qr, ev_paired, NULL, ev_message,
-                    ev_receipt, ev_chat_name};
+                    ev_receipt, ev_chat_name, ev_history_chat, ev_push_name,
+                    ev_history_done};
     CHECK(wa_client_init(&g_client, &cfg, &ev) == 0);
     CHECK(wa_client_connect(&g_client) == 0);
 
     uint64_t deadline = plat_now_ms() + 30000;
     int sent = 0, group_sent = 0;
-    while (plat_now_ms() < deadline && !(g_obs.group_delivered && g_obs.group_msg)) {
+    while (plat_now_ms() < deadline &&
+           !(g_obs.group_delivered && g_obs.group_msg && g_obs.hist_done)) {
         struct pollfd p = {wa_client_fd(&g_client), POLLIN, 0};
         int t = wa_client_next_timeout(&g_client);
         if (t < 0 || t > 200)
@@ -1158,6 +1417,21 @@ static void test_end_to_end(void)
     CHECK_STR(g_obs.group_text, GROUP_IN_TEXT);
     CHECK_STR(g_obs.group_sender, MARIA_JID);
     CHECK_STR(g_obs.chat_name, "Familia");
+    /* history sync */
+    CHECK(g_obs.hist_done);
+    CHECK(g_obs.hist_chats == 2);
+    CHECK(g_obs.hist_messages == HIST_MSGS + 1);
+    CHECK(g_obs.maria_n == ZAPC_HISTORY_PER_CHAT);
+    CHECK_STR(g_obs.maria_first, "historico 8"); /* newest 32 of 40 */
+    CHECK_STR(g_obs.maria_last, "historico 39");
+    CHECK_STR(g_obs.maria_name, "Maria Silva");
+    CHECK(g_obs.maria_unread == 2);
+    CHECK(g_obs.maria_ts == 1039);
+    CHECK(g_obs.maria_from_me == 11); /* i % 3 == 0 for i in 8..39 */
+    CHECK_STR(g_obs.group2_name, "Trabalho");
+    CHECK_STR(g_obs.group2_sender, "5511777776666@s.whatsapp.net");
+    CHECK_STR(g_obs.group2_push, "Joao");
+    CHECK_STR(g_obs.joao, "Joao");
 
     /* credentials persisted: a fresh load sees the pairing */
     wa_device d;

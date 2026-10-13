@@ -592,6 +592,14 @@ static void handle_success(wa_client *c, const wa_node *n)
                    WA_CONTENT_CHILDREN};
     (void)wa_send_iq(c, &iq2, IQ_GENERIC, -1, NULL, 0);
 
+    /* <iq xmlns="w:m" type="set"><media_conn/></iq> */
+    wa_attr a3[] = {WA_ATTR("id", ""), WA_ATTR("xmlns", "w:m"),
+                    WA_ATTR("type", "set"), WA_ATTR_JID("to", WA_SERVER_USER)};
+    wa_node mconn = {"media_conn", NULL, 0, NULL, 0, NULL, 0, WA_CONTENT_NONE};
+    wa_node iq3 = {"iq", a3, WA_COUNT(a3), &mconn, 1, NULL, 0,
+                   WA_CONTENT_CHILDREN};
+    (void)wa_send_iq(c, &iq3, IQ_MEDIA_CONN, -1, NULL, 0);
+
     c->keepalive_at = plat_now_ms() + (uint64_t)c->cfg->keepalive_s * 1000u;
     set_state(c, WA_ST_LOGGED_IN, NULL);
 }
@@ -1009,6 +1017,10 @@ void wa_client_tick(wa_client *c)
             send_keepalive(c);
         c->keepalive_at = now + (uint64_t)c->cfg->keepalive_s * 1000u;
     }
+    if (c->state == WA_ST_LOGGED_IN && c->hist_count > 0) {
+        wa_history_run_pending(c);
+        now = plat_now_ms();
+    }
     if (c->state == WA_ST_PAIRING && c->qr_next_at != 0 && now >= c->qr_next_at) {
         c->qr_ref_index++;
         if (c->qr_ref_index >= c->qr_ref_count) {
@@ -1035,6 +1047,8 @@ int wa_client_next_timeout(const wa_client *c)
 {
     uint64_t now = plat_now_ms();
     uint64_t next = 0;
+    if (c->state == WA_ST_LOGGED_IN && c->hist_count > 0)
+        return 0;
     uint64_t cand[4] = {c->state == WA_ST_LOGGED_IN ? c->keepalive_at : 0,
                         c->state == WA_ST_DISCONNECTED ? c->reconnect_at : 0,
                         c->state == WA_ST_PAIRING ? c->qr_next_at : 0, 0};

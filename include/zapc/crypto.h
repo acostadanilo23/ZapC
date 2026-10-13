@@ -58,6 +58,34 @@ long crypto_aes256_cbc_decrypt(const uint8_t key[32], const uint8_t iv[16],
                                const void *in, size_t len, uint8_t *out,
                                size_t out_cap);
 
+/* ---- streaming interfaces (for large media / history blobs) ------------ */
+typedef struct {
+    void *impl;
+} zc_sha256_ctx;
+int zc_sha256_init(zc_sha256_ctx *c);
+int zc_sha256_update(zc_sha256_ctx *c, const void *data, size_t len);
+int zc_sha256_final(zc_sha256_ctx *c, uint8_t out[32]); /* also frees */
+
+typedef struct {
+    zc_sha256_ctx inner;
+    uint8_t opad[64];
+} zc_hmac_ctx;
+int zc_hmac_sha256_init(zc_hmac_ctx *c, const void *key, size_t key_len);
+int zc_hmac_sha256_update(zc_hmac_ctx *c, const void *data, size_t len);
+int zc_hmac_sha256_final(zc_hmac_ctx *c, uint8_t out[32]);
+
+typedef struct {
+    void *impl;
+} zc_cbc_ctx;
+/* AES-256-CBC decryption with PKCS#7 padding removed at the end. */
+int zc_cbc_decrypt_init(zc_cbc_ctx *c, const uint8_t key[32],
+                        const uint8_t iv[16]);
+/* out must hold len + 16 bytes. Returns bytes written or -1. */
+long zc_cbc_decrypt_update(zc_cbc_ctx *c, const uint8_t *in, size_t len,
+                           uint8_t *out);
+long zc_cbc_decrypt_final(zc_cbc_ctx *c, uint8_t out[16]); /* also frees */
+void zc_cbc_free(zc_cbc_ctx *c);
+
 /* ---- Curve25519 (portable implementation) ------------------------------- */
 #define CURVE25519_KEY_LEN 32
 #define XEDDSA_SIG_LEN 64

@@ -3,6 +3,7 @@
  * pipeline (device list -> prekey bundles -> encrypt -> send).
  */
 #include "zapc/crypto.h"
+#include "zapc/history_sync.h"
 #include "zapc/log.h"
 #include "zapc/platform.h"
 #include "zapc/protobuf.h"
@@ -30,6 +31,8 @@ typedef struct {
     size_t skdm_len;
     char dsm_dest[WA_JID_STR_MAX]; /* deviceSentMessage.destinationJid */
     int found;
+    const uint8_t *hist;     /* protocolMessage.historySyncNotification */
+    size_t hist_len;
 } msg_extract;
 
 static void copy_text(msg_extract *x, const char *prefix, const uint8_t *s,
@@ -127,11 +130,19 @@ static void extract(msg_extract *x, const uint8_t *msg, size_t len, int depth)
         case 12: { /* protocolMessage */
             uint64_t type = 99;
             pb_find_varint(f.data, f.len, 2, &type);
+            if (sub_string(f.data, f.len, 6, &s, &sl)) {
+                x->hist = s;
+                x->hist_len = sl;
+            }
             if (type == 0)
                 copy_text(x, "[mensagem apagada]", (const uint8_t *)"", 0, "");
             else if (type == 14 && sub_string(f.data, f.len, 14, &s, &sl)) {
                 char tmp[ZAPC_MSG_TEXT_MAX];
-                msg_extract y = {tmp, sizeof tmp, NULL, 0, "", 0};
+                msg_extract y;
+                memset(&y, 0, sizeof y);
+                y.out = tmp;
+                y.cap = sizeof tmp;
+                tmp[0] = '\0';
                 extract(&y, s, sl, depth + 1);
                 if (y.found)
                     copy_text(x, "[editada] ", (const uint8_t *)tmp,
@@ -169,6 +180,18 @@ static void extract(msg_extract *x, const uint8_t *msg, size_t len, int depth)
     }
 }
 
+int wa_extract_text(const uint8_t *msg, size_t len, char *out, size_t cap)
+{
+    msg_extract x;
+    memset(&x, 0, sizeof x);
+    x.out = out;
+    x.cap = cap;
+    if (cap > 0)
+        out[0] = '\0';
+    extract(&x, msg, len, 0);
+    return x.found ? (int)strlen(out) : 0;
+}
+
 /* ======================================================================== */
 /* receiving                                                                */
 /* ======================================================================== */
@@ -196,6 +219,45 @@ static void send_receipt(wa_client *c, const wa_node *node, const char *type)
         a[n++] = (wa_attr)WA_ATTR("type", type);
     wa_node r = {"receipt", a, n, NULL, 0, NULL, 0, WA_CONTENT_NONE};
     (void)wa_send_node(c, &r);
+}
+
+/* Queue a HistorySyncNotification for processing outside the receive path. */
+static int queue_history(wa_client *c, const uint8_t *n, size_t len)
+{
+    const uint8_t *p;
+    size_t pl;
+    uint64_t type = 0;
+    if (!c->cfg->history_sync || c->hist_count >= WA_MAX_HIST_JOBS) {
+        LOGW("msg", "skipping history sync notification");
+        return -1;
+    }
+    wa_hist_job *job = &c->hist_jobs[c->hist_count];
+    memset(job, 0, sizeof *job);
+    pb_find_varint(n, len, 6, &type);
+    job->sync_type = (unsigned)type;
+    if (pb_find_bytes(n, len, 11, &p, &pl) == 1 && pl > 0) {
+        char rel[64];
+        snprintf(rel, sizeof rel, "hist-inline-%u.z", c->hist_seq++);
+        if (storage_path(job->inline_path, sizeof job->inline_path, rel) != 0 ||
+            plat_write_file_atomic(job->inline_path, p, pl, 0600) != 0)
+            return -1;
+    } else {
+        if (pb_find_bytes(n, len, 5, &p, &pl) != 1 || pl == 0 ||
+            pl >= sizeof job->direct_path)
+            return -1;
+        memcpy(job->direct_path, p, pl);
+        job->direct_path[pl] = '\0';
+        if (pb_find_bytes(n, len, 3, &p, &pl) != 1 || pl != 32)
+            return -1;
+        memcpy(job->media_key, p, 32);
+        if (pb_find_bytes(n, len, 4, &p, &pl) == 1 && pl == 32) {
+            memcpy(job->enc_sha256, p, 32);
+            job->has_enc_sha256 = 1;
+        }
+    }
+    c->hist_count++;
+    LOGI("msg", "history sync (type %u) queued", job->sync_type);
+    return 0;
 }
 
 static void send_retry_receipt(wa_client *c, const wa_node *node)
@@ -273,7 +335,7 @@ void wa_handle_message(wa_client *c, const wa_node *node)
         return;
     }
 
-    int decrypted_any = 0, failed = 0;
+    int decrypted_any = 0, failed = 0, hist_queued = 0;
     for (size_t i = 0; node->content == WA_CONTENT_CHILDREN && i < node->child_count;
          i++) {
         const wa_node *enc = &node->children[i];
@@ -307,11 +369,17 @@ void wa_handle_message(wa_client *c, const wa_node *node)
             }
         }
         decrypted_any = 1;
-        msg_extract x = {m.text, sizeof m.text, NULL, 0, "", m.text[0] != '\0'};
+        msg_extract x;
+        memset(&x, 0, sizeof x);
+        x.out = m.text;
+        x.cap = sizeof m.text;
+        x.found = m.text[0] != '\0';
         extract(&x, plain, (size_t)n, 0);
         if (x.skdm != NULL && is_group &&
             senderkey_process(from_s, addr, x.skdm, x.skdm_len) != 0)
             LOGW("msg", "invalid sender key distribution message");
+        if (x.hist != NULL && m.from_me && queue_history(c, x.hist, x.hist_len) == 0)
+            hist_queued = 1;
         if (x.dsm_dest[0] != '\0' && m.from_me) {
             wa_jid dest;
             if (jid_parse(&dest, x.dsm_dest) == 0)
@@ -320,6 +388,17 @@ void wa_handle_message(wa_client *c, const wa_node *node)
     }
     zap_secure_zero(plain, sizeof plain);
 
+    if (hist_queued) {
+        /* <receipt id=.. type="hist_sync" to=own-jid/> */
+        char own[WA_JID_STR_MAX];
+        wa_jid me;
+        jid_to_non_ad(&me, &c->dev.jid);
+        jid_format(&me, own, sizeof own);
+        wa_attr ha[] = {WA_ATTR("id", id), WA_ATTR("type", "hist_sync"),
+                        WA_ATTR_JID("to", own)};
+        wa_node hr = {"receipt", ha, 3, NULL, 0, NULL, 0, WA_CONTENT_NONE};
+        (void)wa_send_node(c, &hr);
+    }
     if (decrypted_any) {
         send_receipt(c, node, m.from_me ? "sender" : "inactive");
         if (m.text[0] != '\0' && c->ev.on_message != NULL)
@@ -1015,6 +1094,21 @@ void wa_handle_iq_result(wa_client *c, const wa_node *node,
     case IQ_GROUP_INFO:
         handle_group_info(c, node, req);
         break;
+    case IQ_MEDIA_CONN: {
+        const wa_node *mc = wa_node_child(node, "media_conn");
+        c->n_media_hosts = 0;
+        for (size_t i = 0; mc != NULL && mc->content == WA_CONTENT_CHILDREN &&
+                           i < mc->child_count && c->n_media_hosts < WA_MEDIA_HOSTS;
+             i++) {
+            const char *h = wa_node_attr(&mc->children[i], "hostname");
+            if (strcmp(mc->children[i].tag, "host") == 0 && h != NULL &&
+                strlen(h) < sizeof c->media_hosts[0])
+                zstrlcpy(c->media_hosts[c->n_media_hosts++], h,
+                         sizeof c->media_hosts[0]);
+        }
+        LOGD("wa", "%d media hosts", c->n_media_hosts);
+        break;
+    }
     case IQ_USYNC_DEVICES:
         handle_usync_result(c, node);
         break;
