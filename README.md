@@ -122,7 +122,68 @@ varints, profundidade de aninhamento), chaves privadas nunca vão para o log.
 
 ## Estado
 
-Veja a seção de estado detalhado no fim deste arquivo.
+| Etapa da SPEC | Situação |
+|---|---|
+| 0 Core (TUI, config, log, memória, event loop) | feito |
+| 1 TCP/TLS (SNI, verificação de certificado e hostname) | feito (OpenSSL) |
+| 2 WebSocket RFC 6455 | feito |
+| 3 Protocolo binário (JID, nós, tokens) | feito |
+| 4 Noise (com verificação da cadeia de certificados) | feito |
+| 5 Pareamento por QR, credenciais, reconexão sem QR | feito |
+| 6 Receber mensagens (texto; mídia mostrada como `[Imagem]` etc.) | feito |
+| 7 Enviar mensagens + confirmações (✓ enviado, ✓✓ entregue/lido) | feito |
+| 8 Grupos (receber, enviar, nomes) | feito |
+| 9 History sync em streaming | feito (últimas 32 mensagens por conversa) |
+| 10 Otimização | em andamento |
+
+**Importante:** todo o protocolo foi testado localmente, mas ainda **não**
+contra os servidores reais do WhatsApp (o ambiente de desenvolvimento não
+tinha acesso à rede do WhatsApp). O que foi verificado:
+
+- primitivas criptográficas com vetores oficiais (RFC 7748, 5869, 4231) e as
+  assinaturas XEdDSA validadas pelo Ed25519 do OpenSSL;
+- compatibilidade byte a byte do Signal (X3DH nos dois papéis, ratchet,
+  mensagens fora de ordem, sender keys) contra o **python-axolotl**, uma
+  implementação independente da libsignal (`make interop`);
+- QR codes idênticos, módulo a módulo, aos de uma biblioteca independente;
+- um teste ponta a ponta (`tests/test_integration.c`) com um servidor falso
+  que fala TLS + WebSocket + Noise e conduz o cliente real por pareamento,
+  reinício 515, login, upload de prekeys, mensagens diretas nos dois sentidos
+  (incluindo o próprio celular), grupos nos dois sentidos e history sync
+  baixado por HTTPS.
+
+Os formatos de mensagens e nós seguem as referências (whatsmeow,
+whatsapp-rust), mas detalhes que só o servidor real valida podem precisar de
+ajuste no primeiro uso. Se a conexão falhar, rode com `--log-level debug` (ou
+`trace`, que mostra os nós trocados, sem conteúdo cifrado) e veja
+`~/.local/state/zapc/zapc.log`. Se o servidor recusar a versão (erro 405), o
+ZapC busca automaticamente a versão atual em `web.whatsapp.com/sw.js`.
+
+Ainda não implementado: download/upload de mídia (`/download`, `/upload`),
+retry de mensagens que o destinatário não conseguiu decifrar, app state sync
+(nomes de contatos da agenda, arquivar, silenciar), pairing code, chamadas.
+
+### Memória
+
+Medido no x86_64 (build release, binário de ~200 KB sem símbolos):
+
+- ocioso: ~3,7 MB de RSS (incluindo as bibliotecas do OpenSSL);
+- teste ponta a ponta completo (pareamento, mensagens, grupos, history sync):
+  pico de ~9,5 MB no processo de teste inteiro.
+
+Os maiores buffers fixos: frame Noise (256 KB), descompressão de frames
+(256 KB), arena de nós (64 KB), envelopes de envio (96 KB), history sync
+(~110 KB). Todos ajustáveis em `build_config.h`; num port para o PS2, trocar o
+OpenSSL por um TLS pequeno reduz bastante o total.
+
+## Testes
+
+```sh
+make test          # unitários + ponta a ponta (servidor falso)
+make debug test    # o mesmo com ASan/UBSan (MODE=debug)
+make interop       # compatibilidade Signal com python-axolotl (pip install python-axolotl)
+make fuzz          # alvos libFuzzer (clang + compiler-rt)
+```
 
 ## Licença
 
