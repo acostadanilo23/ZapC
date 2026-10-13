@@ -166,6 +166,9 @@ int wa_send_text(wa_client *c, const wa_jid *to, const char *text,
 int wa_mark_read(wa_client *c, const wa_jid *chat, const wa_jid *sender,
                  const char *msg_id);
 
+/* Testing only: verify the server certificate chain against another root. */
+void wa_set_noise_root_key(const uint8_t key[32]);
+
 /* ---- internal (shared between client.c, pairing.c and message.c) -------- */
 void wa_handle_pair_device(wa_client *c, const wa_node *iq);
 void wa_handle_pair_success(wa_client *c, const wa_node *iq);

@@ -86,7 +86,7 @@ BIN      = $(BUILD)/zapc
 TEST_SRC = $(wildcard tests/test_*.c)
 TEST_BIN = $(TEST_SRC:tests/%.c=$(BUILD)/tests/%)
 
-.PHONY: all debug release test clean fuzz
+.PHONY: all debug release test clean interop
 
 all: $(BIN)
 	@ln -sf $(BIN) zapc
@@ -117,6 +117,15 @@ test: $(TEST_BIN)
 		if ./$$t; then :; else fail=1; fi; \
 	done; \
 	if [ $$fail -eq 0 ]; then echo "all tests passed"; else echo "TESTS FAILED"; exit 1; fi
+
+# Signal wire-compatibility check against python-axolotl (an independent
+# libsignal implementation).  Needs: pip install python-axolotl
+PYTHON ?= python3
+$(BUILD)/sigtool: tools/interop/sigtool.c $(LIB)
+	$(CC) $(ALL_CFLAGS) -Wno-missing-prototypes $(ALL_LDFLAGS) -o $@ $< $(LIB) $(LIBS)
+
+interop: $(BUILD)/sigtool
+	PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python $(PYTHON) tools/interop/interop.py $(BUILD)/sigtool $(BUILD)/interop-run
 
 clean:
 	rm -rf build zapc

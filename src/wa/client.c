@@ -28,6 +28,14 @@ static const uint8_t WA_CERT_PUBKEY[32] = {
     0x5c, 0x6c, 0xe1, 0xf7, 0xf9, 0x54, 0x5d, 0xa8, 0xee, 0x6b};
 #define WA_CERT_ISSUER_SERIAL 0
 
+/* Test hook: alternative root key (NULL = the real one). */
+static const uint8_t *g_cert_root = WA_CERT_PUBKEY;
+
+void wa_set_noise_root_key(const uint8_t key[32])
+{
+    g_cert_root = key != NULL ? key : WA_CERT_PUBKEY;
+}
+
 static const uint8_t WA_CONN_HEADER[4] = {'W', 'A', WA_MAGIC, WA_DICT_VERSION};
 
 const char *wa_state_name(wa_state st)
@@ -405,7 +413,7 @@ static int verify_server_cert(const uint8_t *chain, size_t len,
         LOGE("wa", "malformed noise certificate");
         return -1;
     }
-    if (xeddsa_verify(WA_CERT_PUBKEY, id, idl, is) != 0) {
+    if (xeddsa_verify(g_cert_root, id, idl, is) != 0) {
         LOGE("wa", "intermediate certificate signature invalid");
         return -1;
     }
